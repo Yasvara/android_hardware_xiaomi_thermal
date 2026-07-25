@@ -1,0 +1,71 @@
+# Copyright (C) 2026 IRedDragonICY
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# MiThermalEngine — Rust SOTA thermal daemon
+# Replaces mi_thermald with open-source framework-integrated thermal management.
+# Communicates with GameSpace ThermalController via system properties.
+
+service mi_thermal_engine /vendor/bin/mi_thermal_engine
+    class core
+    user system
+    group system
+    writepid /dev/cpuset/system-background/tasks
+    # Restart on crash — kernel thermal_core provides hardware safety net
+    oneshot
+    disabled
+
+# Override mi_thermald to prevent it from ever starting
+service mi_thermald /vendor/bin/mi_thermald
+    disabled
+    override
+
+# Start mi_thermal_engine on boot (after thermal zones are available)
+on boot
+    # Core thermal control nodes
+    chown system system /sys/class/thermal/thermal_message/sconfig
+    chown system system /sys/class/thermal/thermal_message/boost
+    chown system system /sys/class/thermal/thermal_message/temp_state
+    chown system system /sys/class/thermal/thermal_message/screen_state
+    chown system system /sys/class/thermal/thermal_message/cpu_nolimit_temp
+    chown system system /sys/class/thermal/thermal_message/cpu_limits
+    chown system system /sys/class/thermal/thermal_message/modem_limit
+    chown system system /sys/class/thermal/thermal_message/modem_level
+    chown system system /sys/class/thermal/thermal_message/thermal_max_brightness
+    chown system system /sys/class/thermal/thermal_message/market_download_limit
+
+    chmod 0664 /sys/class/thermal/thermal_message/sconfig
+    chmod 0664 /sys/class/thermal/thermal_message/boost
+    chmod 0664 /sys/class/thermal/thermal_message/temp_state
+    chmod 0664 /sys/class/thermal/thermal_message/screen_state
+    chmod 0664 /sys/class/thermal/thermal_message/modem_limit
+    chmod 0664 /sys/class/thermal/thermal_message/modem_level
+    chmod 0664 /sys/class/thermal/thermal_message/thermal_max_brightness
+    chmod 0664 /sys/class/thermal/thermal_message/market_download_limit
+
+    # WALT scheduler boost — default root 0644; GameSpace/daemon run as system
+    chown system system /proc/sys/walt/sched_boost
+    chmod 0664 /proc/sys/walt/sched_boost
+
+    # Adreno GPU frequency + governor control (default root, clocks 0444)
+    chown system system /sys/class/kgsl/kgsl-3d0/min_clock_mhz
+    chown system system /sys/class/kgsl/kgsl-3d0/max_clock_mhz
+    chown system system /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+    chown system system /sys/class/kgsl/kgsl-3d0/devfreq/max_freq
+    chown system system /sys/class/kgsl/kgsl-3d0/devfreq/governor
+    chmod 0664 /sys/class/kgsl/kgsl-3d0/min_clock_mhz
+    chmod 0664 /sys/class/kgsl/kgsl-3d0/max_clock_mhz
+    chmod 0664 /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+    chmod 0664 /sys/class/kgsl/kgsl-3d0/devfreq/max_freq
+    chmod 0664 /sys/class/kgsl/kgsl-3d0/devfreq/governor
+
+    # CPU cpufreq per-cluster control for GameSpace custom profiles
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq
+    chown system system /sys/devices/system/cpu/cpufreq/policy2/scaling_min_freq
+    chown system system /sys/devices/system/cpu/cpufreq/policy5/scaling_min_freq
+    chown system system /sys/devices/system/cpu/cpufreq/policy7/scaling_min_freq
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy2/scaling_min_freq
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy5/scaling_min_freq
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy7/scaling_min_freq
+
+    start mi_thermal_engine

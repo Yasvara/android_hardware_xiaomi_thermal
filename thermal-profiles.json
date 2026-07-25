@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "sensor": {
+    "name": "VIRTUAL-SENSOR0",
+    "weights": {
+      "battery": 242,
+      "pa_therm0": 424,
+      "pa_therm1": -165,
+      "quiet_therm": 715,
+      "charger_therm": -228,
+      "wifi_therm": 222,
+      "cpu_therm": -268
+    },
+    "weight_sum": 1000,
+    "compensation": 1034
+  },
+  "profiles": {
+    "GLOBAL": {
+      "sconfig": 0,
+      "name": "Default",
+      "description": "Default throttle profile — moderate throttle for daily use",
+      "ss": {
+        "cpu0": {
+          "device": "cpu0",
+          "polling_ms": 2000,
+          "levels": [
+            {"trig": 40000, "clr": 38000, "freq": 1785600},
+            {"trig": 45000, "clr": 43000, "freq": 1516800},
+            {"trig": 48000, "clr": 46000, "freq": 1075200}
+          ]
+        },
+        "cpu2": {
+          "device": "cpu2",
+          "polling_ms": 2000,
+          "levels": [
+            {"trig": 25000, "clr": 23000, "freq": 2707200},
+            {"trig": 32000, "clr": 30000, "freq": 2323200},
+            {"trig": 37000, "clr": 35000, "freq": 2073600},
+            {"trig": 39000, "clr": 37000, "freq": 1824000},
+            {"trig": 41000, "clr": 39000, "freq": 1516800},
+            {"trig": 43000, "clr": 41000, "freq": 1401600},
+            {"trig": 44000, "clr": 43000, "freq": 1401600},
+            {"trig": 45000, "clr": 44000, "freq": 1401600},
+            {"trig": 46000, "clr": 45000, "freq": 1401600},
+            {"trig": 47000, "clr": 46000, "freq": 1286400},
+            {"trig": 48000, "clr": 47000, "freq": 940800},
+            {"trig": 49000, "clr": 48000, "freq": 787200},
+            {"trig": 50000, "clr": 49000, "freq": 787200}
+          ]
+        },
+        "cpu5": {
+          "device": "cpu5",
+          "polling_ms": 2000,
+          "levels": [
+            {"trig": 25000, "clr": 23000, "freq": 2707200},
+            {"trig": 32000, "clr": 30000, "freq": 2323200},
+            {"trig": 37000, "clr": 35000, "freq": 2073600},
+            {"trig": 39000, "clr": 37000, "freq": 1824000},
+            {"trig": 41000, "clr": 39000, "freq": 1401600},
+            {"trig": 43000, "clr": 41000, "freq": 1401600},
+            {"trig": 44000, "clr": 43000, "freq": 1401600},
+            {"trig": 45000, "clr": 44000, "freq": 1401600},
+            {"trig": 46000, "clr": 45000, "freq": 1401600},
+            {"trig": 47000, "clr": 46000, "freq": 1286400},
+            {"trig": 48000, "clr": 47000, "freq": 940800},
+            {"trig": 49000, "clr": 48000, "freq": 787200},
+            {"trig": 50000, "clr": 49000, "freq": 480000}
+          ]
+        },
+        "cpu7": {
+          "device": "cpu7",
+          "polling_ms": 2000,
+          "levels": [
+            {"trig": 25000, "clr": 23000, "freq": 2745600},
+            {"trig": 32000, "clr": 30000, "freq": 2284800},
+            {"trig": 37000, "clr": 35000, "freq": 2054400},
+            {"trig": 39000, "clr": 37000, "freq": 1785600},
+            {"trig": 41000, "clr": 39000, "freq": 1478400},
+            {"trig": 43000, "clr": 41000, "freq": 1363200},
+            {"trig": 44000, "clr": 43000, "freq": 1228800},
+            {"trig": 45000, "clr": 44000, "freq": 1094400},
+            {"trig": 46000, "clr": 45000, "freq": 1094400},
+            {"trig": 47000, "clr": 46000, "freq": 960000},
+            {"trig": 48000, "clr": 47000, "freq": 787200}
+          ]
+        }
+      },
+      "sic": {
+        "device": "thermal_fcc_override",
+        "polling_ms": 5000,
+        "levels": [
+          {"trig": 15000, "clr": 14000, "target": 0,     "max": 15600, "min": 15600, "ks": 0,       "ki": 0,     "kc": 0},
+          {"trig": 31800, "clr": 25000, "target": 0,     "max": 12400, "min": 12400, "ks": 0,       "ki": 0,     "kc": 0},
+          {"trig": 33500, "clr": 30800, "target": 32000, "max": 9000,  "min": 9000,  "ks": 0,       "ki": 0,     "kc": 0},
+          {"trig": 34600, "clr": 33000, "target": 36000, "max": 9000,  "min": 5000,  "ks": 2000000, "ki": 50000, "kc": 50000},
+          {"trig": 37000, "clr": 35500, "target": 38000, "max": 8000,  "min": 5000,  "ks": 2000000, "ki": 50000, "kc": 50000},
+          {"trig": 39000, "clr": 37400, "target": 40500, "max": 5000,  "min": 2500,  "ks": 2000000, "ki": 500000,"kc": 500000},
+          {"trig": 44500, "clr": 44000, "target": 44500, "max": 2000,  "min": 2000,  "ks": 3500000, "ki": 25000, "kc": 250000},
+          {"trig": 45000, "clr": 44500, "target": 45000, "max": 1000,  "min": 1000,  "ks": 3500000, "ki": 25000, "kc": 250000},
+          {"trig": 46000, "clr": 45500, "target": 46000, "max": 600,   "min": 600,   "ks": 3500000, "ki": 25000, "kc": 250000}
+        ]
+      },
+      "monitors": {
+        "battery": {"trig": [34500, 37000, 38000, 40000, 41000, 43000, 44500, 45500, 46500, 47500], "clr": [33500, 36000, 37000, 39500, 40000, 42000, 44000, 45000, 45500, 46000], "target": [202, 500, 700, 808, 1010, 1100, 1200, 1300, 1400, 1515]},
+        "gpu": {"trig": [15000, 40000, 45000], "clr": [13000, 38000, 43000], "target": [0, 3, 5]},
+        "backlight": {"trig": [51000], "clr": [49000], "target": [160]},
+        "core_park": {"trig": [50000], "clr": [48000], "devices": "cpu2+cpu3+cpu7"},
+        "boost_limit": {"trig": [48000], "clr": [45000], "target": [1]},
+        "modem_level": {"trig": [41000, 43000, 45000, 46000], "clr": [39000, 41000, 43000, 45000], "target": [1, 2, 3, 4]},
+        "download": {"trig": [40000], "clr": [37000], "target": [1]}
+      }
+    },
+    "MGAME": {
+      "sconfig": 19,
+      "name": "Balanced Gaming",
+      "description": "Gaming-optimized — throttle starts at 36°C VSENSOR0, wider freq range",
+      "ss": {
+        "cpu0": {
+          "device": "cpu0",
+          "polling_ms": 2000,
+          "levels": [
+            {"trig": 43000, "clr": 42000, "freq": 1516800},
+            {"trig": 46000, "clr": 44000, "freq": 1075200}
+          ]
+        },
+        "cpu2": {
+          "device": "cpu2",
+          "polling_ms": 2000,
+          "levels": [
+            {"trig": 36000, "clr": 34000, "freq": 2208000},
+            {"trig": 42500, "clr": 41500, "freq": 2073600},
+            {"trig": 43200, "clr": 42500, "freq": 1920000},
+            {"trig": 43900, "clr": 43200, "freq": 1728000},
+            {"trig": 44600, "clr": 43900, "freq": 1516800},
+            {"trig": 45300, "clr": 44600, "freq": 1286400},
+            {"trig": 46000, "clr": 45300, "freq": 633600}
+          ]
+        },
+        "cpu5": {
+          "device": "cpu5",
+          "polling_ms": 2000,
+          "levels": [
+            {"trig": 36000, "clr": 34000, "freq": 2323200},
+            {"trig": 42500, "clr": 41500, "freq": 2073600},
+            {"trig": 43200, "clr": 42500, "freq": 1920000},
+            {"trig": 43900, "clr": 43200, "freq": 1728000},
+            {"trig": 44600, "clr": 43900, "freq": 1516800},
+            {"trig": 45300, "clr": 44600, "freq": 1286400},
+            {"trig": 46000, "clr": 45300, "freq": 633600}
+          ]
+        },
+        "cpu7": {
+          "device": "cpu7",
+          "polling_ms": 2000,
+          "levels": [
+            {"trig": 36000, "clr": 34000, "freq": 2400000},
+            {"trig": 42500, "clr": 41500, "freq": 2054400},
+            {"trig": 43200, "clr": 42500, "freq": 1920000},
+            {"trig": 43900, "clr": 43200, "freq": 1785600},
+            {"trig": 44600, "clr": 43900, "freq": 1670400},
+            {"trig": 45300, "clr": 44600, "freq": 1478400},
+            {"trig": 46000, "clr": 45300, "freq": 787200}
+          ]
+        }
+      },
+      "sic": {
+        "device": "thermal_fcc_override",
+        "polling_ms": 2000,
+        "levels": [
+          {"trig": 15000, "clr": 14000, "target": 0,     "max": 15600, "min": 15600, "ks": 0,       "ki": 0,     "kc": 0},
+          {"trig": 34500, "clr": 33500, "target": 0,     "max": 10000, "min": 10000, "ks": 0,       "ki": 0,     "kc": 0},
+          {"trig": 37500, "clr": 36500, "target": 38000, "max": 6000,  "min": 6000,  "ks": 3500000, "ki": 25000, "kc": 250000},
+          {"trig": 38500, "clr": 38000, "target": 39000, "max": 3500,  "min": 2200,  "ks": 3500000, "ki": 25000, "kc": 150000},
+          {"trig": 41000, "clr": 40500, "target": 42000, "max": 3000,  "min": 2200,  "ks": 3500000, "ki": 25000, "kc": 250000},
+          {"trig": 42500, "clr": 41500, "target": 43500, "max": 3000,  "min": 2200,  "ks": 3500000, "ki": 25000, "kc": 250000},
+          {"trig": 44000, "clr": 43500, "target": 45000, "max": 1500,  "min": 1500,  "ks": 3500000, "ki": 25000, "kc": 250000},
+          {"trig": 45000, "clr": 44000, "target": 45500, "max": 500,   "min": 500,   "ks": 3500000, "ki": 25000, "kc": 250000}
+        ]
+      },
+      "monitors": {
+        "battery": {"trig": [34500, 37500, 38500, 41000, 42500, 44000, 45500], "clr": [33500, 36500, 38000, 40500, 41500, 43500, 44500], "target": [202, 606, 808, 909, 1010, 1111, 1515]},
+        "gpu": {"trig": [15000], "clr": [13000], "target": [3]},
+        "backlight": {"trig": [51000], "clr": [49000], "target": [160]},
+        "core_park": {"trig": [50000], "clr": [48000], "devices": "cpu2+cpu3+cpu7"},
+        "boost_limit": {"trig": [48000], "clr": [45000], "target": [1]},
+        "download": {"trig": [40000], "clr": [37000], "target": [1]}
+      }
+    },
+    "NOLIMITS": {
+      "sconfig": 6,
+      "name": "Performance",
+      "description": "No thermal throttle — max CPU/GPU freq, device will get hot",
+      "ss": {},
+      "sic": null,
+      "monitors": {}
+    }
+  },
+  "cpu_clusters": {
+    "cpu0": {"policy": "policy0", "cpus": [0, 1], "type": "Cortex-A520", "max_freq": 2016000, "min_freq": 307200},
+    "cpu2": {"policy": "policy2", "cpus": [2, 3, 4], "type": "Cortex-A725", "max_freq": 3014400, "min_freq": 614400},
+    "cpu5": {"policy": "policy5", "cpus": [5, 6], "type": "Cortex-A725", "max_freq": 2803200, "min_freq": 614400},
+    "cpu7": {"policy": "policy7", "cpus": [7], "type": "Cortex-X925", "max_freq": 3206400, "min_freq": 614400}
+  },
+  "gpu": {
+    "freqs_mhz": [1162, 1150, 1090, 965, 915, 873, 763, 685, 515, 300, 150],
+    "max_level": 10
+  }
+}

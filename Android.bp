@@ -1,0 +1,32 @@
+// Copyright (C) 2026 IRedDragonICY
+// SPDX-License-Identifier: GPL-2.0-only
+
+license {
+    name: "mi_thermal_engine_license",
+    license_kinds: ["SPDX-license-identifier-GPL-2.0-only"],
+    license_text: ["NOTICE"],
+}
+
+package {
+    default_applicable_licenses: ["mi_thermal_engine_license"],
+}
+
+rust_binary {
+    name: "mi_thermal_engine",
+    srcs: ["src/main.rs"],
+    crate_name: "mi_thermal_engine",
+    edition: "2021",
+    vendor: true,
+    prefer_rlib: true,
+
+    init_rc: ["mi_thermal_engine.rc"],
+
+    rustlibs: [
+        "liblibc",
+        "libnix",
+        "liblog_rust",
+        "libandroid_logger",
+        "librustutils",
+        "libanyhow",
+    ],
+}
