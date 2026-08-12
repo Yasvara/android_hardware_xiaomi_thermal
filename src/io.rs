@@ -101,6 +101,26 @@ impl SysfsFd {
         }
     }
 
+    /// Write `"<prefix> <value>"` on the stack — no heap allocation.
+    ///
+    /// The mca_charge_interface nodes (`ichg_limit`, `iin_limit`, ...) parse
+    /// their input with `sscanf(buf, "%s %s %s")` and reject anything that is
+    /// not exactly three fields with -EINVAL, so the caller passes the
+    /// `"<user> <type>"` pair as `prefix`. A bare integer is silently dropped.
+    pub fn write_prefixed_int(&self, prefix: &str, value: i64) {
+        let mut buf = [0u8; PREFIXED_BUF_SIZE];
+        let bytes = match format_prefixed_int(prefix, value, &mut buf) {
+            Some(b) => b,
+            None => {
+                error!("prefix {:?} too long for {}", prefix, self.path);
+                return;
+            }
+        };
+        if let Err(e) = nix::sys::uio::pwrite(&self.file, bytes, 0) {
+            error!("pwrite {} = {:?} {}: {}", self.path, prefix, value, e);
+        }
+    }
+
     #[allow(dead_code)]
     pub fn path(&self) -> &str {
         self.path
@@ -141,6 +161,29 @@ fn parse_int_from_bytes(bytes: &[u8]) -> Option<i64> {
     }
 
     Some(if negative { -result } else { result })
+}
+
+/// Scratch size for [`format_prefixed_int`] — a `"<user> <type>"` pair plus a
+/// space and the widest i64.
+const PREFIXED_BUF_SIZE: usize = 64;
+
+/// Render `"<prefix> <value>"` into `buf`. `None` if it would not fit.
+fn format_prefixed_int<'a>(
+    prefix: &str,
+    value: i64,
+    buf: &'a mut [u8; PREFIXED_BUF_SIZE],
+) -> Option<&'a [u8]> {
+    let plen = prefix.len();
+    let mut num = [0u8; 24];
+    let digits = int_to_bytes(value, &mut num);
+    let end = plen + 1 + digits.len();
+    if end > buf.len() {
+        return None;
+    }
+    buf[..plen].copy_from_slice(prefix.as_bytes());
+    buf[plen] = b' ';
+    buf[plen + 1..end].copy_from_slice(digits);
+    Some(&buf[..end])
 }
 
 /// Convert integer to bytes on stack. Returns the slice containing the number.
@@ -221,5 +264,26 @@ mod tests {
         assert_eq!(int_to_bytes(42000, &mut buf), b"42000");
         assert_eq!(int_to_bytes(-1234, &mut buf), b"-1234");
         assert_eq!(int_to_bytes(0, &mut buf), b"0");
+    }
+
+    #[test]
+    fn test_format_prefixed_int() {
+        let mut buf = [0u8; PREFIXED_BUF_SIZE];
+        // The exact three-field shape mca_charge_interface's sscanf demands.
+        assert_eq!(
+            format_prefixed_int("mithermal buck", 1854, &mut buf),
+            Some(&b"mithermal buck 1854"[..])
+        );
+        assert_eq!(
+            format_prefixed_int("mithermal buck", 0, &mut buf),
+            Some(&b"mithermal buck 0"[..])
+        );
+    }
+
+    #[test]
+    fn test_format_prefixed_int_rejects_overflow() {
+        let mut buf = [0u8; PREFIXED_BUF_SIZE];
+        let long = "x".repeat(PREFIXED_BUF_SIZE);
+        assert_eq!(format_prefixed_int(&long, 1, &mut buf), None);
     }
 }

@@ -211,6 +211,9 @@ fn poll_cycle(
     // Reload config from system properties (every 5 cycles)
     config.maybe_reload();
 
+    // Reload custom charging profile if mode="custom" and seq changed
+    sic.maybe_reload_custom();
+
     // Skip all actions if disabled (but still poll sensors for monitoring)
     let enabled = config.enabled;
 
@@ -274,6 +277,10 @@ fn poll_cycle(
         ),
         None => (config.temp_limit_mc, config.max_fcc_ua),
     };
+
+    // Battery safeguard — independent of VSENSOR0 fusion.
+    sic.update_battery_safeguard(sensors.battery_temp);
+
     // current_now is negative while charging; charge_current_ua() is the ≥0
     // in-flowing magnitude. voltage=0 (missing fd) degrades to plain feedback.
     sic.run_with_feedforward(

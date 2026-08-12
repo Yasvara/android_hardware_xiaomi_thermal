@@ -11,15 +11,12 @@ package {
     default_applicable_licenses: ["mi_thermal_engine_license"],
 }
 
-rust_binary {
-    name: "mi_thermal_engine",
+rust_defaults {
+    name: "mi_thermal_engine_defaults",
     srcs: ["src/main.rs"],
     crate_name: "mi_thermal_engine",
     edition: "2021",
     vendor: true,
-    prefer_rlib: true,
-
-    init_rc: ["mi_thermal_engine.rc"],
 
     rustlibs: [
         "liblibc",
@@ -29,4 +26,21 @@ rust_binary {
         "librustutils",
         "libanyhow",
     ],
+}
+
+rust_binary {
+    name: "mi_thermal_engine",
+    defaults: ["mi_thermal_engine_defaults"],
+    prefer_rlib: true,
+
+    init_rc: ["mi_thermal_engine.rc"],
+}
+
+// The SIC tier maths and the sysfs write formats are the parts that fail
+// silently on-device (a rejected write still returns success to the caller),
+// so keep them under test.
+rust_test {
+    name: "mi_thermal_engine_test",
+    defaults: ["mi_thermal_engine_defaults"],
+    test_suites: ["general-tests"],
 }

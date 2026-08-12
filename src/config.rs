@@ -56,8 +56,8 @@ impl Config {
     pub fn new() -> Self {
         let mut cfg = Config {
             temp_limit_mc: 38000,     // 38.0°C default
-            max_fcc_ua: 15_480_000,   // 90W default (90 * 172000)
-            min_fcc_ua: 860_000,      // 5W default (5 * 172000)
+            max_fcc_ua: 20_000_000,   // 90W full hardware limit (20A)
+            min_fcc_ua: 100_000,      // 100mA default
             enabled: true,
             temp_offset_mc: 0,
             poll_counter: 0,
@@ -124,10 +124,10 @@ impl Config {
             info!("Config: temp_limit = {}°C", self.temp_limit_mc as f64 / 1000.0);
         }
         if self.max_fcc_ua != old_max {
-            info!("Config: max_fcc = {} µA ({}W)", self.max_fcc_ua, self.max_fcc_ua / 172000);
+            info!("Config: max_fcc = {} µA ({:.1}A)", self.max_fcc_ua, self.max_fcc_ua as f64 / 1_000_000.0);
         }
         if self.min_fcc_ua != old_min {
-            info!("Config: min_fcc = {} µA ({}W)", self.min_fcc_ua, self.min_fcc_ua / 172000);
+            info!("Config: min_fcc = {} µA ({:.1}A)", self.min_fcc_ua, self.min_fcc_ua as f64 / 1_000_000.0);
         }
         if self.enabled != old_enabled {
             info!("Config: enabled = {}", self.enabled);

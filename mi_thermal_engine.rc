@@ -10,8 +10,11 @@ service mi_thermal_engine /vendor/bin/mi_thermal_engine
     user system
     group system
     writepid /dev/cpuset/system-background/tasks
-    # Restart on crash — kernel thermal_core provides hardware safety net
-    oneshot
+    # Restart on crash — kernel thermal_core provides the hardware safety net.
+    # NOT oneshot: this is a permanent daemon, and oneshot would stop init from
+    # ever restarting it. That matters because SIC can leave charging suspended
+    # (input_suspend = "mipower buck 1") at the emergency threshold; only the
+    # daemon clears it, so a dead daemon would strand charging OFF until reboot.
     disabled
 
 # Override mi_thermald to prevent it from ever starting
@@ -42,6 +45,23 @@ on boot
     chmod 0664 /sys/class/thermal/thermal_message/thermal_max_brightness
     chmod 0664 /sys/class/thermal/thermal_message/market_download_limit
 
+    # Charging thermal control nodes
+    chown system system /sys/devices/platform/soc/soc:mca_charger_thermal/wired_chg_curr
+    chown system system /sys/devices/platform/soc/soc:mca_charger_thermal/wired_chg_curr2
+    chown system system /sys/devices/platform/soc/soc:mca_charger_thermal/wired_thermal_remove
+    chown system system /sys/devices/platform/soc/soc:mca_charge_interface/input_suspend
+    chown system system /sys/devices/platform/soc/soc:mca_charge_interface/ichg_limit
+    chown system system /sys/class/power_supply/battery/constant_charge_current_max
+    chown system system /sys/class/power_supply/battery/thermal_fcc
+
+    chmod 0664 /sys/devices/platform/soc/soc:mca_charger_thermal/wired_chg_curr
+    chmod 0664 /sys/devices/platform/soc/soc:mca_charger_thermal/wired_chg_curr2
+    chmod 0664 /sys/devices/platform/soc/soc:mca_charger_thermal/wired_thermal_remove
+    chmod 0664 /sys/devices/platform/soc/soc:mca_charge_interface/input_suspend
+    chmod 0664 /sys/devices/platform/soc/soc:mca_charge_interface/ichg_limit
+    chmod 0664 /sys/class/power_supply/battery/constant_charge_current_max
+    chmod 0664 /sys/class/power_supply/battery/thermal_fcc
+
     # WALT scheduler boost — default root 0644; GameSpace/daemon run as system
     chown system system /proc/sys/walt/sched_boost
     chmod 0664 /proc/sys/walt/sched_boost
@@ -69,3 +89,8 @@ on boot
     chmod 0664 /sys/devices/system/cpu/cpufreq/policy7/scaling_min_freq
 
     start mi_thermal_engine
+
+# Fail-safe: if the daemon ever stops, make sure it did not leave the charger
+# input suspended. Nothing else in the system clears that flag.
+on property:init.svc.mi_thermal_engine=stopped
+    write /sys/devices/platform/soc/soc:mca_charge_interface/input_suspend "mipower buck 0"
