@@ -17,10 +17,12 @@ service mi_thermal_engine /vendor/bin/mi_thermal_engine
     # daemon clears it, so a dead daemon would strand charging OFF until reboot.
     disabled
 
-# Override mi_thermald to prevent it from ever starting
-service mi_thermald /vendor/bin/mi_thermald
-    disabled
-    override
+# NOTE: the old "service mi_thermald ... disabled/override" stanza is gone on purpose.
+# /vendor/bin/mi_thermald is no longer shipped at all (dropped from proprietary-files.txt),
+# so there is nothing left to override. Its rc was never imported either — the import in
+# device/xiaomi/onyx/rootdir/etc/init.onyx.rc is commented out, and init does not recurse
+# into /vendor/etc/init/hw/. If a blob re-extract ever re-adds the binary, that commented
+# import is the guard that keeps it dead; do not uncomment it.
 
 # Start mi_thermal_engine on boot (after thermal zones are available)
 on boot

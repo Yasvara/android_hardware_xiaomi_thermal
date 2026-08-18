@@ -17,6 +17,7 @@
 //!   independently of the VSENSOR0 fusion
 use log::{info, warn};
 use crate::io::SysfsFd;
+use crate::sensor::KalmanFilter;
 
 // ================================================================
 // Tier table — GLOBAL profile (sconfig=0), from thermal-profiles.json
@@ -38,10 +39,41 @@ const FCC_HARD_MIN_UA: i64 = 100_000;
 const FCC_HARD_MAX_UA: i64 = 20_000_000;
 
 const DEFAULT_SUSPEND_MC: i64 = 48_000;
-const DEFAULT_RESUME_MC: i64  = 45_000;
+const DEFAULT_RESUME_MC: i64 = 45_000;
+
+// ---- SOTA Charge-Pump Silicon Governor (independent of cell fusion) ----
+pub fn cp_governor(cp_mc: i64) -> i64 {
+    let t = cp_mc as f64 / 1000.0;
+    if t < 60.0 { return 22_000_000; }
+    if t < 65.0 { return (22e6 - (t - 60.0) / 5.0 * 10e6) as i64; }
+    if t < 70.0 { return (12e6 - (t - 65.0) / 5.0 * 4e6) as i64; }
+    if t < 75.0 { return (8e6  - (t - 70.0) / 5.0 * 3e6) as i64; }
+    if t < 80.0 { return (5e6  - (t - 75.0) / 5.0 * 2e6) as i64; }
+    2_000_000
+}
+
+// ---- SOTA Predictive Temperature Using Kalman Rate Estimate ----
+const PRED_LOOKAHEAD_S: f64 = 12.0;   // seconds ahead
+const PRED_GAIN: f64        = 0.6;    // damping so we don't over-react
+pub fn predictive_temp(kf: &KalmanFilter, charge_temp_mc: i64) -> i64 {
+    let rate = kf.rate().max(0.0);    // only act on rising temp
+    let ahead = charge_temp_mc as f64 + rate * PRED_LOOKAHEAD_S * PRED_GAIN;
+    (charge_temp_mc as f64).max(ahead) as i64
+}
 
 /// `"<user> <type>"` prefix for the mca_charge_interface sysfs grammar.
 const ICHG_LIMIT_CLIENT: &str = "mithermal buck";
+
+/// Convert adapter APDO wattage (e.g. 120, 90, 67, 33) to max FCC current in µA.
+pub fn apdo_wattage_to_max_fcc_ua(apdo_watt: i64) -> i64 {
+    match apdo_watt {
+        120.. => 22_000_000,    // 120W+ -> 22.0A
+        90..=119 => 20_000_000, // 90W Overclocked -> 20.0A (~83W battery / ~95W adapter)
+        67..=89 => 15_600_000,  // 67W -> 15.6A (div2/div4 ~67W)
+        33..=66 => 6_600_000,   // 33W -> 6.6A
+        _ => 20_000_000,        // Default to 20.0A ceiling
+    }
+}
 
 /// One SIC tier — mirrors a row of the vendor `[GLOBAL-SIC-BAT]` block.
 #[derive(Clone, Copy, Debug)]
@@ -57,16 +89,16 @@ struct SicTier {
 }
 
 const SIC_TIERS_GLOBAL: [SicTier; 9] = [
-    //  trig    clr     target  max_ua      min_ua      ks   ki  kc
-    SicTier{trig_mc:15000, clr_mc:14000, target_mc:0,     max_ua:15_600_000, min_ua:15_600_000, ks:0,   ki:0,  kc:0},
-    SicTier{trig_mc:31800, clr_mc:25000, target_mc:0,     max_ua:12_400_000, min_ua:12_400_000, ks:0,   ki:0,  kc:0},
-    SicTier{trig_mc:33500, clr_mc:30800, target_mc:32000, max_ua: 9_000_000, min_ua: 9_000_000, ks:0,   ki:0,  kc:0},
-    SicTier{trig_mc:34600, clr_mc:33000, target_mc:36000, max_ua: 9_000_000, min_ua: 5_000_000, ks:200, ki:5,  kc:5},
-    SicTier{trig_mc:37000, clr_mc:35500, target_mc:38000, max_ua: 8_000_000, min_ua: 5_000_000, ks:200, ki:5,  kc:5},
-    SicTier{trig_mc:39000, clr_mc:37400, target_mc:40500, max_ua: 5_000_000, min_ua: 2_500_000, ks:200, ki:50, kc:50},
-    SicTier{trig_mc:44500, clr_mc:44000, target_mc:44500, max_ua: 2_000_000, min_ua: 2_000_000, ks:350, ki:3,  kc:25},
-    SicTier{trig_mc:45000, clr_mc:44500, target_mc:45000, max_ua: 1_000_000, min_ua: 1_000_000, ks:350, ki:3,  kc:25},
-    SicTier{trig_mc:46000, clr_mc:45500, target_mc:46000, max_ua:   600_000, min_ua:   600_000, ks:350, ki:3,  kc:25},
+    //  trig    clr     target  max_ua          min_ua          ks   ki  kc
+    SicTier{trig_mc:15000, clr_mc:14000, target_mc:0,     max_ua:20_000_000, min_ua:20_000_000, ks:0,   ki:0,  kc:0},
+    SicTier{trig_mc:31800, clr_mc:25000, target_mc:0,     max_ua:16_500_000, min_ua:16_500_000, ks:0,   ki:0,  kc:0},
+    SicTier{trig_mc:33500, clr_mc:30800, target_mc:32000, max_ua:13_500_000, min_ua:13_500_000, ks:0,   ki:0,  kc:0},
+    SicTier{trig_mc:34600, clr_mc:33000, target_mc:36000, max_ua:11_000_000, min_ua: 6_000_000, ks:200, ki:5,  kc:5},
+    SicTier{trig_mc:37000, clr_mc:35500, target_mc:38000, max_ua: 9_000_000, min_ua: 6_000_000, ks:200, ki:5,  kc:5},
+    SicTier{trig_mc:39000, clr_mc:37400, target_mc:40500, max_ua: 6_500_000, min_ua: 3_500_000, ks:200, ki:50, kc:50},
+    SicTier{trig_mc:44500, clr_mc:44000, target_mc:44500, max_ua: 3_000_000, min_ua: 3_000_000, ks:350, ki:3,  kc:25},
+    SicTier{trig_mc:45500, clr_mc:45000, target_mc:45500, max_ua: 1_500_000, min_ua: 1_500_000, ks:350, ki:3,  kc:25},
+    SicTier{trig_mc:46500, clr_mc:46000, target_mc:46500, max_ua:   800_000, min_ua:   800_000, ks:350, ki:3,  kc:25},
 ];
 
 /// PID output range: 0..PID_OUTPUT_MAX maps linearly to [tier.max, tier.min].
@@ -79,14 +111,14 @@ const FCC_WRITE_DEADBAND_UA: i64 = 50_000;   // 50 mA
 /// Kernel may cap the real current below our setpoint (PD negotiation).
 /// Only force a re-write if the readback diverges by more than this.
 const FCC_DESYNC_TOLERANCE_UA: i64 = 200_000; // 200 mA
-/// Sane readback range for unit validation (100 mA .. 20 A in µA).
+/// Sane readback range for unit validation (100 mA .. 23 A in µA).
 const FCC_SANE_MIN_UA: i64 = 100_000;
-const FCC_SANE_MAX_UA: i64 = 20_000_000;
+const FCC_SANE_MAX_UA: i64 = 23_000_000;
 
 // ---- Battery safeguard (called from main.rs) ----
 /// Above this battery temp (mC), force FCC to at most BATT_SAFEGUARD_FCC_UA.
-const BATT_SAFEGUARD_MC: i64 = 43_000;       // 43°C
-const BATT_SAFEGUARD_FCC_UA: i64 = 2_000_000; // 2 A
+const BATT_SAFEGUARD_MC: i64 = 45_000;       // 45°C
+const BATT_SAFEGUARD_FCC_UA: i64 = 3_000_000; // 3 A
 
 // ---- Feedforward (kept from Phase 1.2) ----
 const FEEDFORWARD_CURRENT_DELTA_UA: i64 = 3_000_000;
@@ -132,6 +164,8 @@ pub struct SicAlgo {
     suspend_fd: Option<SysfsFd>,
     /// Kernel bypass-charging state (mca_smart_charge). Absent on older kernels.
     bypass_state_fd: Option<SysfsFd>,
+    /// Type-C adapter maximum negotiated APDO wattage (e.g. 90, 67, 33).
+    apdo_max_fd: Option<SysfsFd>,
 
     // Tier state
     tier_level: i32,       // current tier index (-1 = below all)
@@ -141,6 +175,9 @@ pub struct SicAlgo {
     ek_1: i64,
     ek_2: i64,
     output_level: i64,     // 0..PID_OUTPUT_MAX
+
+    // SOTA Kalman filter for charge_temp
+    temp_filter: KalmanFilter,
 
     // Applied state
     applied_fcc: i64,
@@ -175,13 +212,18 @@ impl SicAlgo {
             "/sys/devices/platform/soc/soc:mca_charge_interface/input_suspend");
         let bypass_state_fd = SysfsFd::open_ro(
             "/sys/class/xm_power/charger/smart_charge/bypass_charge_state");
+        let apdo_max_fd = SysfsFd::open_ro(
+            "/sys/class/xm_power/typec/apdo_max")
+            .or_else(|| SysfsFd::open_ro(
+                "/sys/devices/virtual/xm_power/typec/apdo_max"));
 
         SicAlgo {
             fcc_fd1, fcc_fd2, thermal_remove_fd, ichg_limit_fd, suspend_fd,
-            bypass_state_fd,
+            bypass_state_fd, apdo_max_fd,
             tier_level: -1,
             tier_floor: -1,
             ek_1: 0, ek_2: 0, output_level: 0,
+            temp_filter: KalmanFilter::new(),
             applied_fcc: -1,
             emergency_suspend: false,
             prev_charge_current_ua: 0,
@@ -259,33 +301,36 @@ impl SicAlgo {
 
     /// Compatibility shim (no telemetry).
     #[allow(dead_code)]
-    pub fn run(&mut self, vsensor0_mc: i64, target_mc: i64, max_fcc_ua: i64, min_fcc_ua: i64) {
-        self.run_with_feedforward(vsensor0_mc, target_mc, max_fcc_ua, min_fcc_ua, 0, 0);
+    pub fn run(&mut self, charge_temp_mc: i64, target_mc: i64, max_fcc_ua: i64, min_fcc_ua: i64) {
+        self.run_with_feedforward(charge_temp_mc, charge_temp_mc, charge_temp_mc, target_mc, max_fcc_ua, min_fcc_ua, 0, 0);
     }
 
-    /// Battery safeguard floor — called from main.rs each cycle.
-    pub fn update_battery_safeguard(&mut self, battery_temp_mc: i64) {
+    /// Battery safeguard floor — called from main.rs each cycle with physical NTC.
+    pub fn update_battery_safeguard(&mut self, batt_ntc_mc: i64) {
         let active = self.active_tiers();
-        if battery_temp_mc > BATT_SAFEGUARD_MC {
+        if batt_ntc_mc > BATT_SAFEGUARD_MC {
             let floor = active.iter()
                 .position(|t| t.max_ua <= BATT_SAFEGUARD_FCC_UA)
                 .map(|i| i as i32)
                 .unwrap_or((active.len() - 1) as i32);
             if self.tier_floor != floor {
-                info!("SIC: battery {:.1}°C → safeguard floor tier {}",
-                    battery_temp_mc as f64 / 1000.0, floor);
+                info!("SIC: batt_ntc {:.1}°C → safeguard floor tier {}",
+                    batt_ntc_mc as f64 / 1000.0, floor);
                 self.tier_floor = floor;
             }
-        } else if self.tier_floor >= 0 && battery_temp_mc < BATT_SAFEGUARD_MC - 2000 {
+        } else if self.tier_floor >= 0 && batt_ntc_mc < BATT_SAFEGUARD_MC - 2000 {
             self.tier_floor = -1; // 2°C hysteresis to release
         }
     }
 
-    /// Main per-cycle entry point.
+    /// Main per-cycle entry point. Driven by charge_temp (positive cell fusion),
+    /// batt_ntc (physical NTC safeguard), and charger_therm (charge-pump silicon governor).
     pub fn run_with_feedforward(
         &mut self,
-        vsensor0_mc: i64,
-        _target_mc: i64,   // kept for API compat; tiers carry their own setpoints
+        charge_temp_mc: i64,      // from SensorPool.charge_temp
+        batt_ntc_mc: i64,         // physical NTC for safeguard
+        charger_therm_mc: i64,    // pump temp for governor
+        _target_mc: i64,          // kept for API compat; tiers carry their own setpoints
         max_fcc_ua: i64,
         min_fcc_ua: i64,
         charge_current_ua: i64,
@@ -319,19 +364,28 @@ impl SicAlgo {
         }
         self.prev_charge_current_ua = charge_current_ua;
 
-        // ---- Tier selection with hysteresis (active table) ----
-        let new_tier = compute_tier_level(self.active_tiers(), self.tier_level, vsensor0_mc);
+        // ---- SOTA Predictive Temperature (Kalman Rate Lookahead) ----
+        self.temp_filter.update(charge_temp_mc);
+        let eff = predictive_temp(&self.temp_filter, charge_temp_mc);
+
+        // ---- Tier selection with hysteresis on predictive effective temp ----
+        let new_tier = compute_tier_level(self.active_tiers(), self.tier_level, eff);
         let effective_tier = new_tier.max(self.tier_floor);
 
         if effective_tier != self.tier_level {
-            info!("SIC: tier {} → {} (VSENSOR0={:.1}°C, table={})",
-                self.tier_level, effective_tier, vsensor0_mc as f64 / 1000.0,
+            info!("SIC: tier {} → {} (cT={:.1}°C eff={:.1}°C table={})",
+                self.tier_level, effective_tier, charge_temp_mc as f64 / 1000.0,
+                eff as f64 / 1000.0,
                 if self.custom_tiers.is_empty() { "GLOBAL" } else { "CUSTOM" });
             self.output_level = 0;
             self.ek_1 = 0;
             self.ek_2 = 0;
             self.tier_level = effective_tier;
         }
+
+        // ---- Dynamic Adapter APDO & User Ceiling ----
+        let dynamic_adapter_fcc = self.apdo_max_fd.as_ref().and_then(|fd| fd.read_int()).map(apdo_wattage_to_max_fcc_ua);
+        let dynamic_ceiling_ua = dynamic_adapter_fcc.unwrap_or(max_fcc_ua).min(max_fcc_ua);
 
         // ---- Compute target FCC ----
         let tiers_len = self.active_tiers().len();
@@ -344,13 +398,17 @@ impl SicAlgo {
         let target_fcc = match tier {
             None => {
                 // Below all tiers — full charge, PID already reset above.
-                self.active_tiers().first().map(|t| t.max_ua).unwrap_or(max_fcc_ua)
+                self.active_tiers().first().map(|t| t.max_ua.min(dynamic_ceiling_ua)).unwrap_or(dynamic_ceiling_ua)
             }
             Some(t) => {
                 if t.target_mc == 0 || t.max_ua == t.min_ua {
-                    t.max_ua // pure cap tier
+                    if effective_tier == 0 {
+                        t.max_ua.min(dynamic_ceiling_ua)
+                    } else {
+                        t.max_ua
+                    }
                 } else {
-                    let ek = vsensor0_mc - t.target_mc;
+                    let ek = eff - t.target_mc;
 
                     let (eff_ki, eff_kc) = match phase {
                         ChargePhase::CV          => (t.ki / 3, t.kc * 2),
@@ -379,22 +437,25 @@ impl SicAlgo {
             }
         };
 
-        // ---- User clamp (GameSpace max/min) ----
-        // The min_fcc floor is a safety net for the *vendor* table, whose deepest
-        // rung is a fixed 600 mA. A custom profile states its own floor and ceiling on every
-        // tier, and applying global min/max FCC silently clamps deep/fast tiers —
-        // a 90W profile could then never reach 90W if global max_fcc is lingering at 4.3A.
+        // (a) Charge-Pump Governor (clamps ceiling based on charger_therm silicon)
+        let target_fcc = target_fcc.min(cp_governor(charger_therm_mc));
+
+        // (b) Hard physical NTC safeguard (caps at 3A when real cell > 45°C)
+        let target_fcc = if batt_ntc_mc > 45_000 {
+            target_fcc.min(3_000_000)
+        } else {
+            target_fcc
+        };
+
+        // ---- User clamp (GameSpace max/min & dynamic adapter ceiling) ----
         let (floor_ua, ceil_ua) = if self.custom_tiers.is_empty() {
-            (min_fcc_ua, max_fcc_ua)
+            (min_fcc_ua, dynamic_ceiling_ua)
         } else {
             (FCC_HARD_MIN_UA, FCC_HARD_MAX_UA)
         };
         let target_fcc = target_fcc.clamp(floor_ua.min(ceil_ua), ceil_ua);
 
         // ---- Anti-desync write with tolerance + unit validation ----
-        // A re-armed escape hatch voids the vote without changing any readback
-        // we could otherwise diff against, so treat it as an unconditional
-        // re-assert of the whole setpoint rather than just clearing the flag.
         let mut needs_write = self.thermal_limit_removed()
             || (target_fcc - self.applied_fcc).abs() > FCC_WRITE_DEADBAND_UA;
         if !needs_write {
@@ -412,8 +473,10 @@ impl SicAlgo {
         if needs_write {
             self.write_fcc(target_fcc);
             let tier_label = if effective_tier >= 0 { effective_tier } else { -1 };
-            info!("SIC: VSENSOR0={:.1}°C tier={} {:?} ff={} table={} → FCC={} µA ({:.1}A)",
-                vsensor0_mc as f64 / 1000.0,
+            info!("SIC: cT={:.1}°C NTC={:.1}°C CP={:.1}°C tier={} {:?} ff={} table={} → FCC={} µA ({:.1}A)",
+                charge_temp_mc as f64 / 1000.0,
+                batt_ntc_mc as f64 / 1000.0,
+                charger_therm_mc as f64 / 1000.0,
                 tier_label,
                 phase,
                 self.feedforward_offset,
@@ -730,7 +793,7 @@ mod tests {
     }
 
     fn run_cycle(a: &mut SicAlgo, temp: i64) -> i64 {
-        a.run_with_feedforward(temp, 38_000, 15_480_000, 860_000, 5_000_000, 4_000_000);
+        a.run_with_feedforward(temp, temp, temp, 38_000, 15_480_000, 860_000, 5_000_000, 4_000_000);
         a.applied_fcc
     }
 
@@ -811,7 +874,7 @@ mod tests {
     #[test]
     fn sic_user_clamp_respected() {
         let mut a = make_algo();
-        a.run_with_feedforward(30_000, 38_000, 10_000_000, 860_000, 5_000_000, 4_000_000);
+        a.run_with_feedforward(30_000, 30_000, 30_000, 38_000, 10_000_000, 860_000, 5_000_000, 4_000_000);
         assert_eq!(a.applied_fcc, 10_000_000, "user max 10A must clamp tier 0");
     }
 
@@ -824,7 +887,7 @@ mod tests {
             SicTier{trig_mc:41_000,clr_mc:39_000,target_mc:0,max_ua:100_000,min_ua:100_000,ks:0,ki:0,kc:0},
         ];
         // min_fcc_ua is the 5 W global floor from persist.sys.mithermal.min_fcc.
-        a.run_with_feedforward(42_000, 38_000, 15_480_000, 860_000, 5_000_000, 4_000_000);
+        a.run_with_feedforward(42_000, 42_000, 42_000, 38_000, 15_480_000, 860_000, 5_000_000, 4_000_000);
         assert_eq!(a.applied_fcc, 100_000,
             "custom tier floor must survive the global min_fcc floor");
     }
@@ -833,7 +896,7 @@ mod tests {
     fn vendor_table_still_honours_min_fcc_floor() {
         let mut a = SicAlgo::new();
         for t in [30_000, 35_000, 40_000, 44_500, 46_000] {
-            a.run_with_feedforward(t, 38_000, 15_480_000, 1_000_000, 5_000_000, 4_000_000);
+            a.run_with_feedforward(t, t, t, 38_000, 15_480_000, 1_000_000, 5_000_000, 4_000_000);
         }
         assert_eq!(a.applied_fcc, 1_000_000,
             "vendor tier 8 (600 mA) must still be lifted to the 1 A min_fcc floor");
@@ -844,7 +907,7 @@ mod tests {
         let mut a = SicAlgo::new();
         // A custom SS profile may hand down a sic_max_fcc under config.min_fcc;
         // clamp() would panic on an inverted range.
-        a.run_with_feedforward(30_000, 38_000, 500_000, 860_000, 5_000_000, 4_000_000);
+        a.run_with_feedforward(30_000, 30_000, 30_000, 38_000, 500_000, 860_000, 5_000_000, 4_000_000);
         assert_eq!(a.applied_fcc, 500_000, "ceiling wins when it sits below the floor");
     }
 
@@ -881,7 +944,7 @@ mod tests {
 
         for _ in 0..240 {
             let temp_mc = (t_skin * 1000.0) as i64;
-            a.run_with_feedforward(temp_mc, 38_000, 15_480_000, 860_000,
+            a.run_with_feedforward(temp_mc, temp_mc, temp_mc, 38_000, 15_480_000, 860_000,
                                    5_000_000, 4_000_000);
             let current_a = a.applied_fcc as f64 / 1_000_000.0;
             if current_a < 1.0 { cycles_below_1a += 1; }
@@ -910,7 +973,7 @@ mod tests {
 
         for _ in 0..300 {
             let temp_mc = (t_skin * 1000.0) as i64;
-            a.run_with_feedforward(temp_mc, 38_000, 15_480_000, 860_000,
+            a.run_with_feedforward(temp_mc, temp_mc, temp_mc, 38_000, 15_480_000, 860_000,
                                    3_000_000, 4_000_000);
             let current_a = a.applied_fcc as f64 / 1_000_000.0;
             min_current = min_current.min(current_a);
@@ -962,7 +1025,7 @@ mod tests {
         let mut t = 30.0f64;
         let mut below_1a = 0u32;
         for _ in 0..240 {
-            a.run_with_feedforward((t*1000.0) as i64, 38000, 15_480_000, 860_000, 5_000_000, 4_000_000);
+            a.run_with_feedforward((t*1000.0) as i64, (t*1000.0) as i64, (t*1000.0) as i64, 38000, 15_480_000, 860_000, 5_000_000, 4_000_000);
             let cur = a.applied_fcc as f64 / 1e6;
             if cur < 1.0 { below_1a += 1; }
             let p = 4.2 * cur;

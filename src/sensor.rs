@@ -24,6 +24,13 @@ const VSENSOR_WEIGHTS: [i64; 7] = [242, 424, -165, 715, -228, 222, -268];
 const VSENSOR_WEIGHT_SUM: i64 = 1000; // Divisor — NOT sum of weights
 const VSENSOR_COMPENSATION: i64 = 1034; // milli-°C offset
 
+// ---- SOTA Charging Protection Fusion (Positive weights only) ----
+const BATT_NTC_NAME: &str  = "batt_therm";     // physical cell NTC = TRUTH
+const CHG_THERM_NAME: &str = "charger_therm";  // charge-pump silicon
+
+// Positive-only weights (sum = 1000): ntc / fuel-gauge / pump
+const CSENSOR_WEIGHTS: [i64; 3] = [600, 150, 250];
+
 // ---- Battery fuel-gauge nodes (POCO F7) ----
 // current_now: µA, NEGATIVE while charging (verified on onyx: -1066000 = 1.066A in).
 // voltage_now: µV (verified: 4436000 = 4.436V). Both labelled vendor_sysfs_xm_power,
@@ -150,6 +157,13 @@ pub struct SensorPool {
     battery_zone_idx: i32,
     pub battery_temp: i64,
 
+    // ---- SOTA Charging Protection Sensors ----
+    pub batt_ntc: i64,        // mC — primary cell protection input (batt_therm)
+    pub charger_therm: i64,   // mC — charge-pump silicon temperature
+    pub charge_temp: i64,     // mC — positive-weight fusion for charging
+    batt_ntc_idx: i32,
+    chg_therm_idx: i32,
+
     // ---- Battery power telemetry (for SIC feedforward, Phase 1.2) ----
     current_now_fd: Option<SysfsFd>,
     voltage_now_fd: Option<SysfsFd>,
@@ -181,8 +195,22 @@ impl SensorPool {
             }
         }
 
+        let batt_ntc_idx = thermal_zones.iter()
+            .position(|(n, _)| n == BATT_NTC_NAME)
+            .map(|i| i as i32).unwrap_or(-1);
+        let chg_therm_idx = thermal_zones.iter()
+            .position(|(n, _)| n == CHG_THERM_NAME)
+            .map(|i| i as i32).unwrap_or(-1);
+
+        if batt_ntc_idx < 0 {
+            warn!("batt_therm NTC missing — cell protection degraded");
+        }
+        if chg_therm_idx < 0 {
+            warn!("charger_therm missing — charge pump governor degraded");
+        }
+
         let zone_count = thermal_zones.len();
-        info!("Mapped {} thermal zones for VSENSOR0", zone_count);
+        info!("Mapped {} thermal zones for VSENSOR0 + CSENSOR", zone_count);
 
         SensorPool {
             vsensor_indices,
@@ -196,6 +224,11 @@ impl SensorPool {
             vsensor0: 25000, // 25°C initial
             battery_zone_idx,
             battery_temp: 30000,
+            batt_ntc: 30000,
+            charger_therm: 30000,
+            charge_temp: 30000,
+            batt_ntc_idx,
+            chg_therm_idx,
             current_now_fd: SysfsFd::open_ro(BATTERY_CURRENT_PATH),
             voltage_now_fd: SysfsFd::open_ro(BATTERY_VOLTAGE_PATH),
             battery_current_ua: 0,
@@ -203,7 +236,7 @@ impl SensorPool {
         }
     }
 
-    /// Read all sensors and compute VSENSOR0.
+    /// Read all sensors and compute VSENSOR0 & CSENSOR.
     /// This is called once per polling cycle.
     pub fn poll(&mut self) {
         // Read each VSENSOR0 component, apply per-sensor Kalman filter
@@ -242,6 +275,30 @@ impl SensorPool {
             self.vsensor0 = self.vsensor_fused_filter.update(self.battery_temp + 2000);
             warn!("VSENSOR0 degraded: only {} sensors valid, fallback to battery temp", valid_count);
         }
+
+        // Read physical NTC and charge-pump sensors for SOTA charging protection
+        if self.batt_ntc_idx >= 0 {
+            if let Some(v) = self.thermal_zones[self.batt_ntc_idx as usize].1.read_int() {
+                self.batt_ntc = v;
+            }
+        }
+        if self.chg_therm_idx >= 0 {
+            if let Some(v) = self.thermal_zones[self.chg_therm_idx as usize].1.read_int() {
+                self.charger_therm = v;
+            }
+        }
+
+        // Positive fusion, FLOORED by the real NTC so a lagging fuel-gauge
+        // estimate can never drag the protection temperature down.
+        let src = [self.batt_ntc, self.battery_temp, self.charger_therm];
+        let mut wsum = 0i64;
+        let mut wdiv = 0i64;
+        for i in 0..3 {
+            wsum += src[i] * CSENSOR_WEIGHTS[i];
+            wdiv += CSENSOR_WEIGHTS[i];
+        }
+        let blend = if wdiv > 0 { wsum / wdiv } else { self.batt_ntc };
+        self.charge_temp = self.batt_ntc.max(blend);
 
         // Battery power telemetry for SIC feedforward. Reads are best-effort:
         // on failure we retain the previous value (0 = never-read sentinel, which

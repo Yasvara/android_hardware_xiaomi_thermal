@@ -278,20 +278,21 @@ fn poll_cycle(
         None => (config.temp_limit_mc, config.max_fcc_ua),
     };
 
-    // Battery safeguard — independent of VSENSOR0 fusion.
-    sic.update_battery_safeguard(sensors.battery_temp);
+    // Battery safeguard: PHYSICAL NTC, not fuel gauge.
+    sic.update_battery_safeguard(sensors.batt_ntc);
 
-    // current_now is negative while charging; charge_current_ua() is the ≥0
-    // in-flowing magnitude. voltage=0 (missing fd) degrades to plain feedback.
+    // Charging PID: charge fusion + NTC + pump governor.
     sic.run_with_feedforward(
-        vsensor0,
+        sensors.charge_temp,
+        sensors.batt_ntc,
+        sensors.charger_therm,
         sic_target,
         sic_max_fcc,
         config.min_fcc_ua,
         sensors.charge_current_ua(),
         sensors.battery_voltage_uv,
     );
-    sic.check_emergency(vsensor0);
+    sic.check_emergency(sensors.batt_ntc);
 
     // Phase 3.1: advisory thermal-budget telemetry (computes cpu/gpu fraction
     // split; does not actuate — SS and GPU DVFS own the actuators).
