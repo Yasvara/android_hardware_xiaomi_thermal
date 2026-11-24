@@ -14,7 +14,8 @@
 //! - Adaptive SIC PID with auto-tuning coefficients
 //! - SS algo with decrypted vendor profiles + custom profile support
 //! - Zero-allocation hot path with pre-opened fd pool
-//! - timerfd-based precise 1Hz polling (no drift)
+//! - Drift-free 1Hz polling on a monotonic deadline
+//! - Skin-temperature loop for the default profile, caps lifted while touching
 //!
 //! Architecture:
 //!   GameSpace ThermalController (Kotlin) → system properties → mi_thermal_engine (Rust)
@@ -22,22 +23,34 @@
 
 mod budget;
 mod config;
+mod interactive;
 mod io;
 mod monitor;
+mod policy;
 mod sensor;
 mod sic;
+#[cfg(test)]
+mod sim;
+mod skin;
 mod ss;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Ignore deficits under this magnitude (µA) — measurement noise around 0 A.
+const DEFICIT_THRESHOLD_UA: i64 = 50_000;
+/// Log a sustained deficit every N cycles (1 Hz), not every cycle.
+const DEFICIT_LOG_PERIOD: u32 = 30;
+static DEFICIT_TICKS: AtomicU32 = AtomicU32::new(0);
 
 use log::{error, info, warn, LevelFilter};
-use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags};
-use nix::sys::time::TimeSpec;
 
 use budget::ThermalBudget;
 use config::Config;
-use io::{open_thermal_zones, SysfsFd};
+use interactive::Interactive;
+use io::{discover_thermal_zones, SysfsFd};
 use monitor::MonitorAlgo;
+use policy::PolicyPusher;
 use sensor::SensorPool;
 use sic::SicAlgo;
 use ss::SsAlgo;
@@ -75,9 +88,9 @@ fn main() {
     info!("MiThermalEngine starting — Rust SOTA thermal daemon");
     info!("Built: {}", compile_time());
 
-    // ---- Phase 1: Initialize I/O pool ----
-    let thermal_zones = open_thermal_zones();
-    info!("Opened {} thermal zones", thermal_zones.len());
+    // ---- Phase 1: Discover thermal zones (lazy-open only active roles) ----
+    let thermal_zones = discover_thermal_zones();
+    info!("Discovered {} thermal zones", thermal_zones.len());
 
     if thermal_zones.is_empty() {
         error!("No thermal zones found! Exiting.");
@@ -92,6 +105,20 @@ fn main() {
     let mut ss_algo = SsAlgo::new();
     let mut config = Config::new();
     let mut budget = ThermalBudget::new();
+    // Static charging limits (JEITA bands, per-adapter ceilings, derate ladder,
+    // bypass tunables). Pushed to the mca driver on profile change only; the
+    // per-second FCC vote stays with SicAlgo.
+    let mut policy = PolicyPusher::new();
+
+    // Sync initial user CPU/GPU clock ceilings and charging tuning before first tick.
+    if config.take_chg_dirty() {
+        sensors.apply_tuning(&config.chg);
+        sic_algo.apply_tuning(&config.chg);
+    }
+    if config.take_caps_dirty() {
+        ss_algo.set_user_caps(config.user_cpu_caps);
+        monitor.set_user_gpu_cap(config.user_gpu_cap_hz);
+    }
 
     // Sync the monitor theme to the SS profile that was active at startup, so
     // the first cycles don't run GLOBAL thresholds under a gaming profile.
@@ -103,101 +130,66 @@ fn main() {
           sensors.vsensor0 as f64 / 1000.0,
           sensors.battery_temp as f64 / 1000.0);
 
-    // ---- Phase 3: Create timerfd for precise 1Hz polling ----
-    let timer_fd = match TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::empty()) {
-        Ok(fd) => fd,
-        Err(e) => {
-            error!("Failed to create timerfd: {} — falling back to sleep", e);
-            // Fallback: run with std::thread::sleep
-            run_with_sleep(&mut sensors, &mut sic_algo, &mut monitor, &mut ss_algo,
-                           &mut config, &mut budget);
-            return;
-        }
-    };
-
-    // Set recurring 1-second timer
-    let interval = TimeSpec::from_duration(Duration::from_secs(POLL_INTERVAL_SECS));
-    if let Err(e) = timer_fd.set(
-        Expiration::Interval(interval),
-        TimerSetTimeFlags::empty(),
-    ) {
-        error!("Failed to set timerfd interval: {}", e);
-        run_with_sleep(&mut sensors, &mut sic_algo, &mut monitor, &mut ss_algo,
-                       &mut config, &mut budget);
-        return;
-    }
-
-    info!("Thermal engine started — polling at {}s via timerfd (SS + SIC + monitors)", POLL_INTERVAL_SECS);
+    info!("Thermal engine started — polling at {}s (SS + SIC + monitors)", POLL_INTERVAL_SECS);
 
     // Screen-state fd for adaptive polling (fd-cached like everything else)
     let screen_fd = SysfsFd::open_ro(SCREEN_STATE_PATH);
     let mut screen_on = true;
+    let mut interactive = Interactive::new();
+    let mut interval = Duration::from_secs(POLL_INTERVAL_SECS);
+    let mut next_tick = Instant::now();
+    let mut last_poll = Instant::now();
 
-    // ---- Phase 4: Main loop ----
+    // ---- Phase 3: Main loop ----
+    // Thermal work runs on a 1 Hz (screen-on) / 3 Hz⁻¹ (screen-off) deadline;
+    // only watch the power HAL interaction property when a thermal cap is actually active.
     loop {
-        // Block until timer fires (exact interval, no drift)
-        match timer_fd.wait() {
-            Ok(_) => {}
-            Err(nix::errno::Errno::EINTR) => continue, // Signal interrupted
-            Err(e) => {
-                error!("timerfd wait error: {}", e);
-                std::thread::sleep(Duration::from_secs(1));
+        let now = Instant::now();
+        if now >= next_tick {
+            let dt_s = now.saturating_duration_since(last_poll).as_secs_f64().max(0.1);
+            last_poll = now;
+
+            let now_on = screen_fd
+                .as_ref()
+                .and_then(|fd| fd.read_int())
+                .map(|v| v != 0)
+                .unwrap_or(true);
+            if now_on != screen_on {
+                screen_on = now_on;
+                let secs = if screen_on { POLL_INTERVAL_SECS } else { POLL_INTERVAL_IDLE_SECS };
+                interval = Duration::from_secs(secs);
+                info!("Screen {} -> {}s poll interval",
+                      if screen_on { "ON" } else { "OFF" }, secs);
+            }
+
+            poll_cycle(&mut sensors, &mut sic_algo, &mut monitor, &mut ss_algo,
+                       &mut config, &mut budget, &mut policy, screen_on, dt_s);
+
+            next_tick += interval;
+            if next_tick <= now {
+                next_tick = now + interval; // fell behind (suspend); don't burst
             }
         }
 
-        let now_on = screen_fd
-            .as_ref()
-            .and_then(|fd| fd.read_int())
-            .map(|v| v != 0)
-            .unwrap_or(true);
+        let allowed = screen_on && config.enabled
+            && ss_algo.lifts_on_interaction() && monitor.boost_allowed()
+            && (ss_algo.capped() || monitor.gpu_capped());
+        let lift = interactive.update(allowed, Instant::now());
+        ss_algo.set_lift(lift);
+        monitor.set_lift(lift);
 
-        if now_on != screen_on {
-            screen_on = now_on;
-            let secs = if screen_on { POLL_INTERVAL_SECS } else { POLL_INTERVAL_IDLE_SECS };
-            let interval = TimeSpec::from_duration(Duration::from_secs(secs));
-            if let Err(e) = timer_fd.set(
-                Expiration::Interval(interval),
-                TimerSetTimeFlags::empty(),
-            ) {
-                error!("Failed to re-arm timerfd: {}", e);
-            }
-            info!("Screen {} -> {}s poll interval",
-                  if screen_on { "ON" } else { "OFF" }, secs);
+        let deadline = interactive.exhausted_at().map_or(next_tick, |t| t.min(next_tick));
+        if allowed {
+            interactive.wait(deadline);
+        } else {
+            interactive.sleep_until(deadline);
         }
-
-        poll_cycle(&mut sensors, &mut sic_algo, &mut monitor, &mut ss_algo,
-                   &mut config, &mut budget, screen_on);
-    }
-}
-
-/// Fallback main loop using std::thread::sleep (if timerfd fails).
-fn run_with_sleep(
-    sensors: &mut SensorPool,
-    sic: &mut SicAlgo,
-    monitor: &mut MonitorAlgo,
-    ss: &mut SsAlgo,
-    config: &mut Config,
-    budget: &mut ThermalBudget,
-) {
-    warn!("Running with sleep fallback (timerfd unavailable)");
-    let screen_fd = SysfsFd::open_ro(SCREEN_STATE_PATH);
-    loop {
-        let screen_on = screen_fd
-            .as_ref()
-            .and_then(|fd| fd.read_int())
-            .map(|v| v != 0)
-            .unwrap_or(true);
-        let secs = if screen_on { POLL_INTERVAL_SECS } else { POLL_INTERVAL_IDLE_SECS };
-        std::thread::sleep(Duration::from_secs(secs));
-        poll_cycle(sensors, sic, monitor, ss, config, budget, screen_on);
     }
 }
 
 /// Execute one polling cycle — the hot path.
-/// ZERO heap allocations in this function (except profile switch which is rare).
-#[inline(never)] // Prevent inlining for profiling
-// This is the single per-cycle coordinator for every daemon subsystem; grouping
-// them behind a struct would only move the same references around.
+/// ZERO heap allocations in steady state.
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn poll_cycle(
     sensors: &mut SensorPool,
@@ -206,19 +198,31 @@ fn poll_cycle(
     ss: &mut SsAlgo,
     config: &mut Config,
     budget: &mut ThermalBudget,
+    policy: &mut PolicyPusher,
     screen_on: bool,
+    dt_s: f64,
 ) {
-    // Reload config from system properties (every 5 cycles)
+    // Watch user CPU/GPU caps (0-alloc every cycle) and reload slow config every 5 cycles.
     config.maybe_reload();
 
-    // Reload custom charging profile if mode="custom" and seq changed
+    if config.take_chg_dirty() {
+        sensors.apply_tuning(&config.chg);
+        sic.apply_tuning(&config.chg);
+    }
+    if config.take_caps_dirty() {
+        ss.set_user_caps(config.user_cpu_caps);
+        monitor.set_user_gpu_cap(config.user_gpu_cap_hz);
+    }
+
+    // Reload custom charging profile if mode="custom" and seq changed (0-alloc when unchanged).
     sic.maybe_reload_custom();
+    policy.maybe_reload();
 
     // Skip all actions if disabled (but still poll sensors for monitoring)
     let enabled = config.enabled;
 
-    // Read all sensors: VSENSOR0 (Kalman-fused) + battery power telemetry
-    sensors.poll();
+    // Read all active sensors with true elapsed dt_s.
+    sensors.poll_dt(dt_s);
 
     if !enabled {
         return;
@@ -232,7 +236,6 @@ fn poll_cycle(
     if vsensor0 > EMERGENCY_SHUTDOWN_MC {
         error!("CRITICAL: VSENSOR0={:.1}°C exceeds shutdown threshold!",
                vsensor0 as f64 / 1000.0);
-        // Kernel will handle actual shutdown via thermal_core
     } else if predicted_vsensor0 > EMERGENCY_SHUTDOWN_MC {
         warn!("PREDICTIVE: VSENSOR0={:.1}°C trending to {:.1}°C within {:.0}s",
               vsensor0 as f64 / 1000.0,
@@ -240,36 +243,21 @@ fn poll_cycle(
               PREDICT_WARN_HORIZON_S);
     }
 
-    // Feature B (aggressiveness): subtract the user's headroom offset from the
-    // sensor value the throttle logic sees. Positive offset = perceived cooler =
-    // throttles later. Emergency/SIC/budget still use the RAW vsensor0.
     let throttle_temp = (vsensor0 - config.temp_offset_mc).max(0);
 
-    // Manage profile + sync the monitor theme BEFORE applying CPU levels, so SS
-    // and the monitor never disagree within a cycle. maybe_switch_profile() only
-    // touches the heap on an actual change; take_config_dirty() fires once after
-    // a built-in switch OR a custom (re)load.
     ss.maybe_switch_profile();
     if ss.take_config_dirty() {
         if let Some(extras) = ss.custom_extras() {
-            // Custom profile with extended GPU/monitor knobs → dynamic theme
-            // (Feature A GPU curve, Feature C boost/hotplug/brightness).
             monitor.apply_custom_theme(extras);
         } else {
-            // Built-in, or a CPU-only custom profile. A no-limit SS profile must
-            // also relax the monitor (NOLIMITS via the "performance" key).
             let theme_key = if ss.is_no_limit() { "performance" } else { ss.active_profile_name() };
             monitor.apply_theme(theme_key);
         }
     }
 
-    // Phase 1.1: predictive SS — Kalman dT/dt look-ahead, evaluated on VSENSOR0
-    // (minus the aggressiveness offset).
     let rate = sensors.vsensor_fused_filter.rate();
     ss.run_predictive(throttle_temp, rate);
 
-    // Phase 1.2 + Feature D: SIC charging PID. A custom profile may override the
-    // skin-temp target and max FCC; otherwise the global config values are used.
     let (sic_target, sic_max_fcc) = match ss.custom_extras() {
         Some(e) => (
             if e.sic_target_mc > 0 { e.sic_target_mc } else { config.temp_limit_mc },
@@ -278,30 +266,43 @@ fn poll_cycle(
         None => (config.temp_limit_mc, config.max_fcc_ua),
     };
 
-    // Battery safeguard: PHYSICAL NTC, not fuel gauge.
-    sic.update_battery_safeguard(sensors.batt_ntc);
-
-    // Charging PID: charge fusion + NTC + pump governor.
-    sic.run_with_feedforward(
+    sic.update_battery_safeguard(sensors.cell_temp);
+    sic.run_with_feedforward_dt(
         sensors.charge_temp,
-        sensors.batt_ntc,
+        sensors.cell_temp,
         sensors.charger_therm,
         sic_target,
         sic_max_fcc,
         config.min_fcc_ua,
         sensors.charge_current_ua(),
         sensors.battery_voltage_uv,
+        dt_s,
     );
-    sic.check_emergency(sensors.batt_ntc);
+    sic.check_emergency(
+        sensors.cell_temp, sensors.charger_therm, sensors.charge_current_ua());
 
-    // Phase 3.1: advisory thermal-budget telemetry (computes cpu/gpu fraction
-    // split; does not actuate — SS and GPU DVFS own the actuators).
-    budget.update(vsensor0, config.temp_limit_mc);
+    let net_ua = sensors.net_current_ua();
+    if net_ua < -DEFICIT_THRESHOLD_UA && sensors.battery_voltage_uv > 0 {
+        let n = DEFICIT_TICKS.fetch_add(1, Ordering::Relaxed);
+        if n % DEFICIT_LOG_PERIOD == 0 {
+            warn!("Charging deficit: pack draining {:.2}A ({:.1}W) at cell {:.1}°C \
+                   for {}s — input path is not carrying the load",
+                -net_ua as f64 / 1_000_000.0,
+                -net_ua as f64 * sensors.battery_voltage_uv as f64 / 1e12,
+                sensors.cell_temp as f64 / 1000.0,
+                n + 1);
+        }
+    } else {
+        DEFICIT_TICKS.store(0, Ordering::Relaxed);
+    }
 
-    // Run monitor algo (GPU DVFS, modem, NPU, hotplug, boost, brightness, DDR).
-    // Uses the offset-adjusted temp so the aggressiveness knob relaxes GPU/boost
-    // /hotplug/brightness in lockstep with the CPU. Pointless with display off.
+    // Screen-on only: sample CPU/GPU utilisation and drive demand-aware GPU skin scaling.
+    monitor.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz());
     if screen_on {
+        if ss.skin_output().is_some() {
+            budget.update(vsensor0, ss.skin_target_mc());
+            monitor.set_gpu_share(budget.gpu_share());
+        }
         monitor.run(throttle_temp);
     }
 }

@@ -64,13 +64,13 @@ const THEME_GLOBAL: MonitorTheme = MonitorTheme {
     bl_cap:  160,
 };
 
-/// MGAME theme — relaxed GPU (single level at low), higher boost/hotplug thresholds
+/// MGAME theme — full GPU performance below 43°C, progressive thermal guard above 43°C
 const THEME_MGAME: MonitorTheme = MonitorTheme {
     name: "MGAME",
-    gpu_trig: [15000, 0, 0, 0],
-    gpu_clr:  [13000, 0, 0, 0],
-    gpu_frac: [0.3,   0.0, 0.0, 0.0],  // 30% of max (light throttle)
-    gpu_level_count: 1,
+    gpu_trig: [43000, 46000, 49000, 0],
+    gpu_clr:  [41000, 44000, 47000, 0],
+    gpu_frac: [0.15,  0.30,  0.50,  0.0],
+    gpu_level_count: 3,
     boost_trig: 50000,  // Higher threshold — let game boost stay longer
     boost_clr:  48000,
     hotplug_trig: 52000, // Don't park cores during gaming
@@ -148,12 +148,21 @@ const MON_NPU_CDEV: [i64; 6] = [0, 1, 2, 3, 5, 8];
 const GPU_AVAIL_FREQ_PATH: &str = "/sys/class/kgsl/kgsl-3d0/gpu_available_frequencies";
 const GPU_DEVFREQ_MAX_PATH: &str = "/sys/class/kgsl/kgsl-3d0/devfreq/max_freq";
 
+/// GPU cap at skin-loop output 0: enough for UI composition at 135 Hz.
+const SKIN_GPU_FLOOR_HZ: i64 = 515_000_000;
+
 /// Direct GPU DVFS control via kgsl devfreq/max_freq.
 struct GpuDvfs {
     devfreq_max_fd: Option<SysfsFd>,
     /// Available GPU frequencies (Hz), sorted ascending. Empty ⇒ unavailable.
     available_freqs: Vec<i64>,
     hw_max_hz: i64,
+    /// Thermal cap (Hz); 0 until first set.
+    cap_hz: i64,
+    /// Optional user GPU ceiling from Pentas (`persist.sys.mithermal.user_gpu_cap`), Hz; 0 = uncapped.
+    user_cap_hz: i64,
+    /// Cap lifted to hardware max for an interaction.
+    lift: bool,
     last_written_hz: i64,
 }
 
@@ -189,13 +198,23 @@ impl GpuDvfs {
             devfreq_max_fd,
             available_freqs,
             hw_max_hz,
+            cap_hz: 0,
+            user_cap_hz: 0,
+            lift: false,
             last_written_hz: -1,
         }
     }
 
     /// True when direct DVFS can be used; false ⇒ caller must use cooling_device.
     fn is_available(&self) -> bool {
-        !self.available_freqs.is_empty() && self.devfreq_max_fd.is_some()
+        #[cfg(test)]
+        {
+            !self.available_freqs.is_empty()
+        }
+        #[cfg(not(test))]
+        {
+            !self.available_freqs.is_empty() && self.devfreq_max_fd.is_some()
+        }
     }
 
     /// Cap the GPU to `fraction` (0.0..1.0) of hw_max, snapping to the nearest
@@ -218,11 +237,71 @@ impl GpuDvfs {
             }
         }
 
-        if best != self.last_written_hz {
-            if let Some(ref fd) = self.devfreq_max_fd {
-                fd.write_int(best);
+        self.cap_hz = best;
+        self.apply();
+    }
+
+    /// Cap at `hz`, snapped down to an available frequency.
+    fn set_cap_hz(&mut self, hz: i64) {
+        if let Some(&f) = self.available_freqs.iter().rev().find(|&&f| f <= hz) {
+            self.cap_hz = f;
+        } else if let Some(&f) = self.available_freqs.first() {
+            self.cap_hz = f;
+        }
+        self.apply();
+    }
+
+    fn set_lift(&mut self, lift: bool) {
+        self.lift = lift;
+        self.apply();
+    }
+
+    fn set_user_cap_hz(&mut self, req_hz: i64) {
+        self.user_cap_hz = if req_hz > 0 && !self.available_freqs.is_empty() {
+            let mut best = self.available_freqs[0];
+            let mut best_d = (best - req_hz).abs();
+            for &cand in &self.available_freqs {
+                let d = (cand - req_hz).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = cand;
+                }
             }
-            self.last_written_hz = best;
+            best
+        } else {
+            req_hz.max(0)
+        };
+        self.apply();
+    }
+
+    fn effective_max_hz(&self) -> i64 {
+        if self.user_cap_hz > 0 && self.hw_max_hz > 0 {
+            self.hw_max_hz.min(self.user_cap_hz)
+        } else {
+            self.hw_max_hz
+        }
+    }
+
+    /// Writes `min(thermal_cap, user_cap_hz)` (or `min(hw_max, user_cap_hz)` while lifted).
+    fn apply(&mut self) {
+        let thermal = if self.lift {
+            self.hw_max_hz
+        } else if self.cap_hz > 0 {
+            self.cap_hz
+        } else {
+            self.hw_max_hz
+        };
+        let want = match (thermal > 0, self.user_cap_hz > 0) {
+            (true, true) => thermal.min(self.user_cap_hz),
+            (false, true) => self.user_cap_hz,
+            (true, false) => thermal,
+            (false, false) => 0,
+        };
+        if want > 0 && want != self.last_written_hz {
+            if let Some(ref fd) = self.devfreq_max_fd {
+                fd.write_int(want);
+            }
+            self.last_written_hz = want;
         }
     }
 }
@@ -294,9 +373,8 @@ fn find_ddr_zone_fd() -> Option<SysfsFd> {
         };
         if name.contains("ddr") || name.contains("dram") || name.contains("mem") {
             let p = format!("/sys/class/thermal/thermal_zone{}/temp", i);
-            let path: &'static str = Box::leak(p.into_boxed_str());
             info!("DDR monitor: zone '{}' at thermal_zone{}", name, i);
-            return SysfsFd::open_ro(path);
+            return SysfsFd::open_ro_owned(p);
         }
     }
     warn!("DDR monitor: no ddr/dram/mem thermal zone found");
@@ -329,6 +407,13 @@ pub struct MonitorAlgo {
     // Active monitor theme (owned by value so custom profiles can supply a
     // dynamically-built theme).
     theme: MonitorTheme,
+
+    /// Skin-loop output while it owns the GPU cap instead of the theme ladder.
+    skin_output: Option<f64>,
+    /// Profile-specific GPU floor (Hz) while the skin loop owns the GPU cap.
+    skin_gpu_floor_hz: i64,
+    /// Live GPU share of active compute demand (0.0..1.0) from `ThermalBudget`.
+    gpu_share: f64,
 }
 
 /// Find a cooling device by type name and open its cur_state for rw.
@@ -345,8 +430,7 @@ fn find_cdev(type_name: &str) -> Option<(SysfsFd, i64)> {
                     .and_then(|s| s.trim().parse::<i64>().ok())
                     .unwrap_or(0);
                 let cur_path_str = format!("/sys/class/thermal/cooling_device{}/cur_state", i);
-                let cur_path: &'static str = Box::leak(cur_path_str.into_boxed_str());
-                if let Some(fd) = SysfsFd::open_rw(cur_path) {
+                if let Some(fd) = SysfsFd::open_rw_owned(cur_path_str) {
                     info!("Found cdev '{}' at cooling_device{} (max_state={})",
                           type_name, i, max_state);
                     return Some((fd, max_state));
@@ -411,7 +495,94 @@ impl MonitorAlgo {
             boost_disabled: false,
             brightness_capped: false,
             theme: THEME_GLOBAL,
+            skin_output: None,
+            skin_gpu_floor_hz: SKIN_GPU_FLOOR_HZ,
+            gpu_share: 0.5,
         }
+    }
+
+    /// Pure in-memory constructor for SM8735 closed-loop unit-test simulations (zero sysfs I/O).
+    #[cfg(test)]
+    pub fn new_simulated(profile_name: &str, gpu_opps_hz: &[i64]) -> Self {
+        let mut freqs = gpu_opps_hz.to_vec();
+        freqs.sort_unstable();
+        freqs.dedup();
+        let hw_max_hz = freqs.last().copied().unwrap_or(0);
+        let theme = *get_monitor_theme(profile_name);
+        MonitorAlgo {
+            gpu_cdev_fd: None,
+            gpu_max_state: 0,
+            gpu_dvfs: GpuDvfs {
+                devfreq_max_fd: None,
+                available_freqs: freqs,
+                hw_max_hz,
+                cap_hz: hw_max_hz,
+                user_cap_hz: 0,
+                lift: false,
+                last_written_hz: hw_max_hz,
+            },
+            ddr_monitor: DdrMonitor { zone_fd: None, warned: false, critical: false },
+            npu_cdev_fd: None,
+            hotplug_fds: Vec::new(),
+            modem_limit_fd: None,
+            modem_level_fd: None,
+            boost_fd: None,
+            brightness_fd: None,
+            gpu_level: -1,
+            npu_level: -1,
+            modem_5g_limited: false,
+            modem_level: -1,
+            hotplug_active: false,
+            boost_disabled: false,
+            brightness_capped: false,
+            theme,
+            skin_output: None,
+            skin_gpu_floor_hz: SKIN_GPU_FLOOR_HZ,
+            gpu_share: 0.5,
+        }
+    }
+
+    /// Last GPU ceiling written (`min(thermal, user)` in Hz) for simulation assertions.
+    #[cfg(test)]
+    pub fn applied_gpu_cap_hz(&self) -> i64 {
+        self.gpu_dvfs.last_written_hz
+    }
+
+    /// Update the live GPU share from `ThermalBudget` so skin throttling favors the busy domain.
+    pub fn set_gpu_share(&mut self, share: f64) {
+        self.gpu_share = share;
+    }
+
+    /// Apply user GPU frequency ceiling from Pentas (Hz; `0` = uncapped).
+    pub fn set_user_gpu_cap(&mut self, cap_hz: i64) {
+        self.gpu_dvfs.set_user_cap_hz(cap_hz);
+    }
+
+    /// Hands the GPU cap to the skin loop (`Some(output)`) or back to the theme.
+    pub fn set_skin_output(&mut self, output: Option<f64>, floor_hz: i64) {
+        if self.skin_output.is_some() && output.is_none() {
+            // Re-evaluate the theme ladder from scratch.
+            self.gpu_level = -1;
+            self.restore_gpu();
+        }
+        self.skin_output = output;
+        self.skin_gpu_floor_hz = floor_hz.max(SKIN_GPU_FLOOR_HZ);
+    }
+
+    /// Lifts the GPU cap to hardware max (an interaction) or back.
+    pub fn set_lift(&mut self, lift: bool) {
+        self.gpu_dvfs.set_lift(lift);
+    }
+
+    /// True when the GPU's thermal cap is below its effective unrestricted maximum.
+    pub fn gpu_capped(&self) -> bool {
+        let eff = self.gpu_dvfs.effective_max_hz();
+        self.gpu_dvfs.cap_hz > 0 && eff > 0 && self.gpu_dvfs.cap_hz < eff
+    }
+
+    /// Whether the theme still allows boosting past steady-state limits.
+    pub fn boost_allowed(&self) -> bool {
+        !self.boost_disabled
     }
 
     /// Switch to a built-in monitor theme by profile name.
@@ -509,6 +680,27 @@ impl MonitorAlgo {
     }
 
     fn check_gpu(&mut self, temp: i64) {
+        if let Some(out) = self.skin_output {
+            if self.gpu_dvfs.is_available() {
+                let floor = self.skin_gpu_floor_hz.min(self.gpu_dvfs.hw_max_hz);
+                // Demand-aware skin scaling: when GPU drives >55% of load, hold GPU higher
+                // while Prime CPU sheds heat first; when CPU-bound, step GPU down earlier.
+                let gpu_out = if out >= 1.0 {
+                    1.0
+                } else if out <= 0.0 {
+                    0.0
+                } else if self.gpu_share > 0.55 {
+                    out.powf(0.80)
+                } else if self.gpu_share < 0.35 {
+                    out.powf(1.15)
+                } else {
+                    out
+                };
+                let hz = floor + ((self.gpu_dvfs.hw_max_hz - floor) as f64 * gpu_out) as i64;
+                self.gpu_dvfs.set_cap_hz(hz);
+            }
+            return;
+        }
         if self.theme.gpu_level_count == 0 {
             // No GPU throttling for this theme — restore unrestricted once.
             if self.gpu_level >= 0 {

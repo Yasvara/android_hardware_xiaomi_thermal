@@ -4,11 +4,11 @@
 //! Zero-copy sysfs I/O layer for MiThermalEngine.
 //!
 //! Key optimizations:
-//! - Pre-opened file descriptor pool (open once at startup)
-//! - `pread()`/`pwrite()` with seek-to-0 (avoids open/close per cycle)
-//! - Stack-allocated read buffer (zero heap allocation on hot path)
-//! - Retry logic for transient EAGAIN/EINTR
+//! - Pre-opened file descriptor pool (opened lazily only for active thermal zones)
+//! - `pread()`/`pwrite()` at offset 0 (avoids seek + open/close per cycle)
+//! - Stack-allocated read/write buffers (zero heap allocation on hot path)
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 
 use log::{error, warn};
@@ -20,17 +20,23 @@ const READ_BUF_SIZE: usize = 64;
 /// Uses pread/pwrite to avoid seek + read/write overhead.
 pub struct SysfsFd {
     file: File,
-    path: &'static str,
+    path: Cow<'static, str>,
 }
 
 impl SysfsFd {
     /// Open a sysfs node for reading only.
     pub fn open_ro(path: &'static str) -> Option<Self> {
-        match File::open(path) {
-            Ok(file) => Some(SysfsFd {
-                file,
-                path,
-            }),
+        Self::open_ro_cow(Cow::Borrowed(path))
+    }
+
+    /// Open a dynamically constructed sysfs path for reading only (no `Box::leak`).
+    pub fn open_ro_owned(path: String) -> Option<Self> {
+        Self::open_ro_cow(Cow::Owned(path))
+    }
+
+    fn open_ro_cow(path: Cow<'static, str>) -> Option<Self> {
+        match File::open(path.as_ref()) {
+            Ok(file) => Some(SysfsFd { file, path }),
             Err(e) => {
                 warn!("Failed to open {}: {}", path, e);
                 None
@@ -40,11 +46,17 @@ impl SysfsFd {
 
     /// Open a sysfs node for read-write.
     pub fn open_rw(path: &'static str) -> Option<Self> {
-        match OpenOptions::new().read(true).write(true).open(path) {
-            Ok(file) => Some(SysfsFd {
-                file,
-                path,
-            }),
+        Self::open_rw_cow(Cow::Borrowed(path))
+    }
+
+    /// Open a dynamically constructed sysfs path for read-write (no `Box::leak`).
+    pub fn open_rw_owned(path: String) -> Option<Self> {
+        Self::open_rw_cow(Cow::Owned(path))
+    }
+
+    fn open_rw_cow(path: Cow<'static, str>) -> Option<Self> {
+        match OpenOptions::new().read(true).write(true).open(path.as_ref()) {
+            Ok(file) => Some(SysfsFd { file, path }),
             Err(e) => {
                 warn!("Failed to open rw {}: {}", path, e);
                 None
@@ -60,7 +72,6 @@ impl SysfsFd {
             Ok(n) if n > 0 => parse_int_from_bytes(&buf[..n]),
             Ok(_) => None,
             Err(e) => {
-                // EAGAIN is normal for some sysfs nodes during init
                 if e != nix::errno::Errno::EAGAIN {
                     error!("pread {}: {}", self.path, e);
                 }
@@ -70,12 +81,10 @@ impl SysfsFd {
     }
 
     /// Read raw string content from sysfs node.
-    /// Returns bytes read into the provided buffer.
     #[allow(dead_code)]
     pub fn read_str<'a>(&self, buf: &'a mut [u8]) -> Option<&'a str> {
         match nix::sys::uio::pread(&self.file, buf, 0) {
             Ok(n) if n > 0 => {
-                // Trim trailing whitespace/newline
                 let s = std::str::from_utf8(&buf[..n]).ok()?;
                 Some(s.trim())
             }
@@ -84,9 +93,8 @@ impl SysfsFd {
     }
 
     /// Write an integer value to the sysfs node.
-    /// Uses pwrite at offset 0 — no seek needed.
+    /// Uses pwrite at offset 0 — no seek needed, zero heap allocation.
     pub fn write_int(&self, value: i64) {
-        // itoa on stack — no heap allocation
         let mut buf = [0u8; 24];
         let s = int_to_bytes(value, &mut buf);
         if let Err(e) = nix::sys::uio::pwrite(&self.file, s, 0) {
@@ -102,11 +110,6 @@ impl SysfsFd {
     }
 
     /// Write `"<prefix> <value>"` on the stack — no heap allocation.
-    ///
-    /// The mca_charge_interface nodes (`ichg_limit`, `iin_limit`, ...) parse
-    /// their input with `sscanf(buf, "%s %s %s")` and reject anything that is
-    /// not exactly three fields with -EINVAL, so the caller passes the
-    /// `"<user> <type>"` pair as `prefix`. A bare integer is silently dropped.
     pub fn write_prefixed_int(&self, prefix: &str, value: i64) {
         let mut buf = [0u8; PREFIXED_BUF_SIZE];
         let bytes = match format_prefixed_int(prefix, value, &mut buf) {
@@ -121,19 +124,42 @@ impl SysfsFd {
         }
     }
 
+    /// Write `"<prefix> <a_val>#<b_val>"` on the stack — no heap allocation.
+    pub fn write_prefixed_pair(&self, prefix: &str, a: i64, b: i64) {
+        let mut buf = [0u8; PREFIXED_BUF_SIZE];
+        let plen = prefix.len();
+        let mut na = [0u8; 24];
+        let mut nb = [0u8; 24];
+        let da = int_to_bytes(a, &mut na);
+        let db = int_to_bytes(b, &mut nb);
+        let end = plen + 1 + da.len() + 1 + db.len();
+        if end > buf.len() {
+            error!("prefix {:?} pair too long for {}", prefix, self.path);
+            return;
+        }
+        buf[..plen].copy_from_slice(prefix.as_bytes());
+        buf[plen] = b' ';
+        let p1 = plen + 1;
+        buf[p1..p1 + da.len()].copy_from_slice(da);
+        buf[p1 + da.len()] = b'#';
+        let p2 = p1 + da.len() + 1;
+        buf[p2..end].copy_from_slice(db);
+        if let Err(e) = nix::sys::uio::pwrite(&self.file, &buf[..end], 0) {
+            error!("pwrite {} = {:?} {}#{}: {}", self.path, prefix, a, b, e);
+        }
+    }
+
     #[allow(dead_code)]
     pub fn path(&self) -> &str {
-        self.path
+        self.path.as_ref()
     }
 }
 
 /// Parse integer from raw bytes without String allocation.
-/// Handles leading whitespace, optional sign, trailing whitespace/newline.
 fn parse_int_from_bytes(bytes: &[u8]) -> Option<i64> {
     let mut i = 0;
     let len = bytes.len();
 
-    // Skip leading whitespace
     while i < len && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
@@ -141,13 +167,11 @@ fn parse_int_from_bytes(bytes: &[u8]) -> Option<i64> {
         return None;
     }
 
-    // Handle sign
     let negative = bytes[i] == b'-';
     if negative || bytes[i] == b'+' {
         i += 1;
     }
 
-    // Parse digits
     let mut result: i64 = 0;
     let mut found_digit = false;
     while i < len && bytes[i].is_ascii_digit() {
@@ -163,11 +187,8 @@ fn parse_int_from_bytes(bytes: &[u8]) -> Option<i64> {
     Some(if negative { -result } else { result })
 }
 
-/// Scratch size for [`format_prefixed_int`] — a `"<user> <type>"` pair plus a
-/// space and the widest i64.
 const PREFIXED_BUF_SIZE: usize = 64;
 
-/// Render `"<prefix> <value>"` into `buf`. `None` if it would not fit.
 fn format_prefixed_int<'a>(
     prefix: &str,
     value: i64,
@@ -186,7 +207,6 @@ fn format_prefixed_int<'a>(
     Some(&buf[..end])
 }
 
-/// Convert integer to bytes on stack. Returns the slice containing the number.
 fn int_to_bytes(mut value: i64, buf: &mut [u8; 24]) -> &[u8] {
     if value == 0 {
         buf[0] = b'0';
@@ -213,34 +233,23 @@ fn int_to_bytes(mut value: i64, buf: &mut [u8; 24]) -> &[u8] {
     &buf[pos..]
 }
 
-/// Batch-open multiple sysfs paths for reading.
-/// Returns a Vec of successfully opened fds (skips failures).
-pub fn open_thermal_zones() -> Vec<(String, SysfsFd)> {
+/// Discover thermal zones (`type_name -> temp_path`) WITHOUT holding 70+ unused kernel FDs open.
+/// Only zones actually bound to a sensor role open their `/temp` fd.
+pub fn discover_thermal_zones() -> Vec<(String, String)> {
     let mut zones = Vec::new();
     for i in 0..128 {
-        // Read the zone type first
-        let type_path: String = format!("/sys/class/thermal/thermal_zone{}/type", i);
-        let temp_path_str: String = format!("/sys/class/thermal/thermal_zone{}/temp", i);
-
-        // Try to read the type
+        let type_path = format!("/sys/class/thermal/thermal_zone{}/type", i);
         let type_fd = match File::open(&type_path) {
             Ok(f) => f,
-            Err(_) => break, // No more zones
+            Err(_) => break,
         };
-
         let mut type_buf = [0u8; 64];
         let type_name = match nix::sys::uio::pread(&type_fd, &mut type_buf, 0) {
-            Ok(n) if n > 0 => {
-                String::from_utf8_lossy(&type_buf[..n]).trim().to_string()
-            }
+            Ok(n) if n > 0 => String::from_utf8_lossy(&type_buf[..n]).trim().to_string(),
             _ => continue,
         };
-
-        // Leak the temp path string so we get 'static lifetime for SysfsFd
-        let temp_path: &'static str = Box::leak(temp_path_str.into_boxed_str());
-        if let Some(fd) = SysfsFd::open_ro(temp_path) {
-            zones.push((type_name, fd));
-        }
+        let temp_path = format!("/sys/class/thermal/thermal_zone{}/temp", i);
+        zones.push((type_name, temp_path));
     }
     zones
 }
@@ -269,7 +278,6 @@ mod tests {
     #[test]
     fn test_format_prefixed_int() {
         let mut buf = [0u8; PREFIXED_BUF_SIZE];
-        // The exact three-field shape mca_charge_interface's sscanf demands.
         assert_eq!(
             format_prefixed_int("mithermal buck", 1854, &mut buf),
             Some(&b"mithermal buck 1854"[..])

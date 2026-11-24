@@ -19,7 +19,7 @@
 //! mi_thermal_engine.te). Without it the fd fails to open and this module
 //! degrades to GPU-only utilisation — it never crashes.
 
-use log::info;
+use log::debug;
 
 use crate::io::SysfsFd;
 
@@ -104,9 +104,19 @@ impl ThermalBudget {
         self.log_counter += 1;
         if self.log_counter >= LOG_EVERY {
             self.log_counter = 0;
-            info!("Budget: cpu_util={:.0}% gpu_util={:.0}% pressure={:.2} → cpu_frac={:.2} gpu_frac={:.2}",
-                  self.cpu_util_ema * 100.0, self.gpu_util_ema * 100.0,
-                  pressure, self.cpu_frac, self.gpu_frac);
+            debug!("Budget: cpu_util={:.0}% gpu_util={:.0}% pressure={:.2} → cpu_frac={:.2} gpu_frac={:.2}",
+                   self.cpu_util_ema * 100.0, self.gpu_util_ema * 100.0,
+                   pressure, self.cpu_frac, self.gpu_frac);
+        }
+    }
+
+    /// Fraction of active compute demand coming from the GPU (`0.0..1.0`, `0.5` when idle).
+    pub fn gpu_share(&self) -> f64 {
+        let sum = self.cpu_util_ema + self.gpu_util_ema;
+        if sum > 0.05 {
+            (self.gpu_util_ema / sum).clamp(0.0, 1.0)
+        } else {
+            0.5
         }
     }
 

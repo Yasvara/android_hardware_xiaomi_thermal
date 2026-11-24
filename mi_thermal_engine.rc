@@ -64,6 +64,33 @@ on boot
     chmod 0664 /sys/class/power_supply/battery/constant_charge_current_max
     chmod 0664 /sys/class/power_supply/battery/thermal_fcc
 
+    # Charging *policy* nodes — the limits the control loop above runs inside.
+    # These used to be probe-time DT constants; they are runtime-writable now so
+    # a GameSpace profile can flatten the 48°C derate or lift the 1600 mA input
+    # cap. Same chown as the control nodes: the daemon is "user system", and the
+    # driver creates these root:root, so without this every policy write fails
+    # EACCES and the profile silently keeps vendor policy.
+    chown system system /sys/devices/platform/soc/soc:mca_buckchg_jeita/jeita_table
+    chown system system /sys/devices/platform/soc/soc:mca_buckchg_jeita/jeita_params
+    chown system system /sys/devices/platform/soc/soc:mca_buckchg_jeita/policy_envelope
+    chown system system /sys/devices/platform/soc/soc:mca_strategy_buckchg_class/chg_caps
+    chown system system /sys/devices/platform/soc/soc:mca_charger_thermal/wired_thermal_table
+    chown system system /sys/devices/platform/soc/soc:smart_charge/bypass_params
+    chown system system /sys/devices/platform/soc/soc:smart_charge/bypass_charge
+
+    chmod 0664 /sys/devices/platform/soc/soc:mca_buckchg_jeita/jeita_table
+    chmod 0664 /sys/devices/platform/soc/soc:mca_buckchg_jeita/jeita_params
+    chmod 0664 /sys/devices/platform/soc/soc:mca_buckchg_jeita/policy_envelope
+    chmod 0664 /sys/devices/platform/soc/soc:mca_strategy_buckchg_class/chg_caps
+    chmod 0664 /sys/devices/platform/soc/soc:mca_charger_thermal/wired_thermal_table
+    chmod 0664 /sys/devices/platform/soc/soc:smart_charge/bypass_params
+    chmod 0664 /sys/devices/platform/soc/soc:smart_charge/bypass_charge
+
+    # Charge-pump & Type-C live telemetry (default 0440 root:root; expose RO to system/daemon)
+    chmod 0444 /sys/class/xm_power/cp_master/tdie
+    chmod 0444 /sys/class/xm_power/typec/apdo_max
+    chmod 0444 /sys/class/xm_power/charger/smart_charge/bypass_charge_state
+
     # WALT scheduler boost — default root 0644; GameSpace/daemon run as system
     chown system system /proc/sys/walt/sched_boost
     chmod 0664 /proc/sys/walt/sched_boost
@@ -93,6 +120,6 @@ on boot
     start mi_thermal_engine
 
 # Fail-safe: if the daemon ever stops, make sure it did not leave the charger
-# input suspended. Nothing else in the system clears that flag.
+# input suspended on either buck or quick-charge paths. Nothing else clears it.
 on property:init.svc.mi_thermal_engine=stopped
-    write /sys/devices/platform/soc/soc:mca_charge_interface/input_suspend "mipower buck 0"
+    write /sys/devices/platform/soc/soc:mca_charge_interface/input_suspend "mipower all 0"
