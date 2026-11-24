@@ -36,6 +36,7 @@ on boot
     chown system system /sys/class/thermal/thermal_message/modem_limit
     chown system system /sys/class/thermal/thermal_message/modem_level
     chown system system /sys/class/thermal/thermal_message/thermal_max_brightness
+    chown system system /sys/class/thermal/thermal_message/board_sensor_temp
     chown system system /sys/class/thermal/thermal_message/market_download_limit
 
     chmod 0664 /sys/class/thermal/thermal_message/sconfig
@@ -45,6 +46,7 @@ on boot
     chmod 0664 /sys/class/thermal/thermal_message/modem_limit
     chmod 0664 /sys/class/thermal/thermal_message/modem_level
     chmod 0664 /sys/class/thermal/thermal_message/thermal_max_brightness
+    chmod 0664 /sys/class/thermal/thermal_message/board_sensor_temp
     chmod 0664 /sys/class/thermal/thermal_message/market_download_limit
 
     # Charging thermal control nodes

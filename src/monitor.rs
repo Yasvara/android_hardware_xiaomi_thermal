@@ -394,6 +394,9 @@ pub struct MonitorAlgo {
     modem_level_fd: Option<SysfsFd>,
     boost_fd: Option<SysfsFd>,
     brightness_fd: Option<SysfsFd>,
+    // Skin temperature for the framework's thermal brightness guard, the node stock publishes.
+    skin_temp_fd: Option<SysfsFd>,
+    skin_temp_published_c: i64,
 
     // Current states
     gpu_level: i32,
@@ -475,6 +478,9 @@ impl MonitorAlgo {
         let brightness_fd = SysfsFd::open_rw(
             "/sys/devices/virtual/thermal/thermal_message/thermal_max_brightness"
         );
+        let skin_temp_fd = SysfsFd::open_rw(
+            "/sys/devices/virtual/thermal/thermal_message/board_sensor_temp"
+        );
 
         MonitorAlgo {
             gpu_cdev_fd,
@@ -487,6 +493,8 @@ impl MonitorAlgo {
             modem_level_fd,
             boost_fd,
             brightness_fd,
+            skin_temp_fd,
+            skin_temp_published_c: i64::MIN,
             gpu_level: -1,
             npu_level: -1,
             modem_5g_limited: false,
@@ -528,6 +536,8 @@ impl MonitorAlgo {
             modem_level_fd: None,
             boost_fd: None,
             brightness_fd: None,
+            skin_temp_fd: None,
+            skin_temp_published_c: i64::MIN,
             gpu_level: -1,
             npu_level: -1,
             modem_5g_limited: false,
@@ -676,6 +686,7 @@ impl MonitorAlgo {
         self.check_hotplug(vsensor0_mc);
         self.check_boost(vsensor0_mc);
         self.check_brightness(vsensor0_mc);
+        self.publish_skin_temp(vsensor0_mc);
         self.ddr_monitor.check();
     }
 
@@ -830,6 +841,18 @@ impl MonitorAlgo {
                 fd.write_int(1); // Enable boost
             }
             info!("Monitor Boost: {:.1}°C → boost enabled", temp as f64 / 1000.0);
+        }
+    }
+
+    /// Writes only when the whole degree changes, so the framework's file observer wakes rarely.
+    fn publish_skin_temp(&mut self, temp: i64) {
+        let celsius = temp.div_euclid(1000);
+        if celsius == self.skin_temp_published_c {
+            return;
+        }
+        self.skin_temp_published_c = celsius;
+        if let Some(ref fd) = self.skin_temp_fd {
+            fd.write_int(temp);
         }
     }
 
