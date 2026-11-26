@@ -19,6 +19,12 @@ const PROP_MAX_FCC: &str = "persist.sys.mithermal.max_fcc";
 const PROP_MIN_FCC: &str = "persist.sys.mithermal.min_fcc";
 const PROP_ENABLED: &str = "persist.sys.mithermal.enabled";
 const PROP_TEMP_OFFSET: &str = "persist.sys.mithermal.temp_offset";
+/// Skin temperature the game profiles hold (deci-°C); unset or 0 = profile default.
+const PROP_GAME_TARGET: &str = "persist.sys.mithermal.game_target";
+/// `0` lifts the game profiles' efficiency ceilings (hardware max when cool); default on.
+const PROP_GAME_CEIL: &str = "persist.sys.mithermal.game_ceil";
+const GAME_TARGET_MIN_MC: i64 = 36_000;
+const GAME_TARGET_MAX_MC: i64 = 46_000;
 
 /// User CPU frequency ceilings from Pentas (`"max0,max1,max2,max3"` kHz; `0` = uncapped).
 const PROP_USER_CPU_CAPS: &str = "persist.sys.mithermal.user_cpu_caps";
@@ -188,6 +194,10 @@ pub struct Config {
     pub min_fcc_ua: i64,
     pub enabled: bool,
     pub temp_offset_mc: i64,
+    /// Skin target for game profiles (mC); 0 = profile default.
+    pub game_target_mc: i64,
+    /// Efficiency ceilings of the game profiles.
+    pub game_ceilings: bool,
     pub chg: ChargeTuning,
     pub chg_dirty: bool,
 
@@ -210,6 +220,8 @@ impl Config {
             min_fcc_ua: 100_000,
             enabled: true,
             temp_offset_mc: 0,
+            game_target_mc: 0,
+            game_ceilings: true,
             chg: ChargeTuning::default(),
             chg_dirty: true,
             user_cpu_caps: [0; 4],
@@ -278,6 +290,7 @@ impl Config {
         let old_min = self.min_fcc_ua;
         let old_enabled = self.enabled;
         let old_offset = self.temp_offset_mc;
+        let old_game_target = self.game_target_mc;
 
         if let Some(val) = read_prop_i64(PROP_TEMP_LIMIT) {
             self.temp_limit_mc = val * 100;
@@ -298,6 +311,22 @@ impl Config {
             self.temp_offset_mc = (val * 100).clamp(TEMP_OFFSET_MIN_MC, TEMP_OFFSET_MAX_MC);
         } else {
             self.temp_offset_mc = 0;
+        }
+        self.game_target_mc = match read_prop_i64(PROP_GAME_TARGET) {
+            Some(v) if v > 0 => (v * 100).clamp(GAME_TARGET_MIN_MC, GAME_TARGET_MAX_MC),
+            _ => 0,
+        };
+        let ceilings = read_prop_i64(PROP_GAME_CEIL) != Some(0);
+        if ceilings != self.game_ceilings {
+            info!("Config: game ceilings = {}", if ceilings { "on" } else { "off" });
+            self.game_ceilings = ceilings;
+        }
+        if self.game_target_mc != old_game_target {
+            info!("Config: game_target = {}", if self.game_target_mc > 0 {
+                format!("{:.1}°C", self.game_target_mc as f64 / 1000.0)
+            } else {
+                "profile default".to_string()
+            });
         }
 
         if self.chg.reload() {

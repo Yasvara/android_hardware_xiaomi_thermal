@@ -415,6 +415,8 @@ pub struct MonitorAlgo {
     skin_output: Option<f64>,
     /// Profile-specific GPU floor (Hz) while the skin loop owns the GPU cap.
     skin_gpu_floor_hz: i64,
+    /// GPU cap at skin output 1 (Hz); 0 = hardware max.
+    skin_gpu_ceil_hz: i64,
     /// Live GPU share of active compute demand (0.0..1.0) from `ThermalBudget`.
     gpu_share: f64,
 }
@@ -505,6 +507,7 @@ impl MonitorAlgo {
             theme: THEME_GLOBAL,
             skin_output: None,
             skin_gpu_floor_hz: SKIN_GPU_FLOOR_HZ,
+            skin_gpu_ceil_hz: 0,
             gpu_share: 0.5,
         }
     }
@@ -548,6 +551,7 @@ impl MonitorAlgo {
             theme,
             skin_output: None,
             skin_gpu_floor_hz: SKIN_GPU_FLOOR_HZ,
+            skin_gpu_ceil_hz: 0,
             gpu_share: 0.5,
         }
     }
@@ -569,7 +573,7 @@ impl MonitorAlgo {
     }
 
     /// Hands the GPU cap to the skin loop (`Some(output)`) or back to the theme.
-    pub fn set_skin_output(&mut self, output: Option<f64>, floor_hz: i64) {
+    pub fn set_skin_output(&mut self, output: Option<f64>, floor_hz: i64, ceil_hz: i64) {
         if self.skin_output.is_some() && output.is_none() {
             // Re-evaluate the theme ladder from scratch.
             self.gpu_level = -1;
@@ -577,6 +581,7 @@ impl MonitorAlgo {
         }
         self.skin_output = output;
         self.skin_gpu_floor_hz = floor_hz.max(SKIN_GPU_FLOOR_HZ);
+        self.skin_gpu_ceil_hz = ceil_hz;
     }
 
     /// Lifts the GPU cap to hardware max (an interaction) or back.
@@ -693,7 +698,9 @@ impl MonitorAlgo {
     fn check_gpu(&mut self, temp: i64) {
         if let Some(out) = self.skin_output {
             if self.gpu_dvfs.is_available() {
-                let floor = self.skin_gpu_floor_hz.min(self.gpu_dvfs.hw_max_hz);
+                let hw = self.gpu_dvfs.hw_max_hz;
+                let top = if self.skin_gpu_ceil_hz > 0 { self.skin_gpu_ceil_hz.min(hw) } else { hw };
+                let floor = self.skin_gpu_floor_hz.min(top);
                 // Demand-aware skin scaling: when GPU drives >55% of load, hold GPU higher
                 // while Prime CPU sheds heat first; when CPU-bound, step GPU down earlier.
                 let gpu_out = if out >= 1.0 {
@@ -707,7 +714,7 @@ impl MonitorAlgo {
                 } else {
                     out
                 };
-                let hz = floor + ((self.gpu_dvfs.hw_max_hz - floor) as f64 * gpu_out) as i64;
+                let hz = floor + ((top - floor) as f64 * gpu_out) as i64;
                 self.gpu_dvfs.set_cap_hz(hz);
             }
             return;

@@ -51,6 +51,8 @@ struct ClusterSs {
     steps: Vec<i64>,
     /// Skin-loop cap at output 0.
     floor: i64,
+    /// Skin-loop cap at output 1 (kHz); 0 = hardware max.
+    ceil: i64,
     levels: [SsLevel; MAX_SS_LEVELS],
     level_count: usize,
     name: &'static str,
@@ -111,10 +113,11 @@ impl ClusterSs {
     /// Skin-loop cap: `output` of the way from the floor to hardware max,
     /// snapped down to an available step.
     fn skin_cap(&self, output: f64) -> i64 {
-        if output >= 1.0 || self.hw_max_freq <= self.floor {
-            return self.hw_max_freq;
+        let top = if self.ceil > 0 { self.ceil.min(self.hw_max_freq) } else { self.hw_max_freq };
+        if output >= 1.0 || top <= self.floor {
+            return top;
         }
-        let target = self.floor + ((self.hw_max_freq - self.floor) as f64 * output) as i64;
+        let target = self.floor + ((top - self.floor) as f64 * output) as i64;
         match self.steps.iter().rev().find(|&&f| f <= target) {
             Some(&f) => f.max(self.floor),
             None => target,
@@ -1651,23 +1654,39 @@ struct SkinProfile {
     target_mc: i64,
     floors_khz: [i64; MAX_CLUSTERS],
     cluster_exp: [f64; MAX_CLUSTERS],
+    /// Caps at output 1; 0 = hardware max. Set at the efficiency knee so a cool
+    /// phone does not burn the headroom on clocks that cost more than they give.
+    ceil_khz: [i64; MAX_CLUSTERS],
     gpu_floor_hz: i64,
+    gpu_ceil_hz: i64,
     lifts_on_interaction: bool,
+    /// Follows `persist.sys.mithermal.game_target` when that is set.
+    game: bool,
 }
 
 const SKIN_DEFAULT: SkinProfile = SkinProfile {
     target_mc: TARGET_MC, // 42.0°C
     floors_khz: [1_075_200, 787_200, 787_200, 787_200],
     cluster_exp: [0.55, 0.85, 1.00, 1.45],
+    ceil_khz: [0; MAX_CLUSTERS],
     gpu_floor_hz: 515_000_000,
+    gpu_ceil_hz: 0,
+    game: false,
     lifts_on_interaction: true,
 };
 
+// Ceilings sit at the efficiency knee measured on onyx (fixed load, whole-device power):
+// above them each cluster pays 2-3x the watts per extra MHz. Floors leave the loop room to
+// reach the target: MLBB held 119 FPS with no jank at ~600 MHz GPU, and 685 MHz costs about
+// twice the GPU watts of 515.
 const SKIN_BALANCED_GAMING: SkinProfile = SkinProfile {
-    target_mc: 43_500, // 43.5°C — cool bare-hand gaming, zero 36°C cold-start cap
-    floors_khz: [1_286_400, 1_401_600, 1_286_400, 1_228_800],
+    target_mc: 39_000,
+    floors_khz: [1_075_200, 1_190_400, 1_190_400, 1_094_400],
     cluster_exp: [0.45, 0.80, 0.95, 1.50],
-    gpu_floor_hz: 685_000_000,
+    ceil_khz: [1_900_800, 2_323_200, 2_323_200, 2_169_600],
+    gpu_floor_hz: 515_000_000,
+    gpu_ceil_hz: 965_000_000,
+    game: true,
     lifts_on_interaction: false,
 };
 
@@ -1675,7 +1694,10 @@ const SKIN_HIGH_FPS: SkinProfile = SkinProfile {
     target_mc: 44_500, // 44.5°C — protects 5× A720 for rock-steady 120 FPS MOBA/FPS
     floors_khz: [1_286_400, 1_516_800, 1_401_600, 1_228_800],
     cluster_exp: [0.40, 0.70, 0.80, 1.55],
+    ceil_khz: [0; MAX_CLUSTERS],
     gpu_floor_hz: 685_000_000,
+    gpu_ceil_hz: 0,
+    game: true,
     lifts_on_interaction: false,
 };
 
@@ -1683,7 +1705,10 @@ const SKIN_HEAVY_GAMING: SkinProfile = SkinProfile {
     target_mc: 45_000, // 45.0°C — smooth Genshin / Heavy Gaming equilibrium (zero 633 MHz cliff)
     floors_khz: [1_401_600, 1_516_800, 1_401_600, 1_363_200],
     cluster_exp: [0.45, 0.80, 0.95, 1.50],
+    ceil_khz: [0; MAX_CLUSTERS],
     gpu_floor_hz: 685_000_000,
+    gpu_ceil_hz: 0,
+    game: true,
     lifts_on_interaction: false,
 };
 
@@ -1691,7 +1716,10 @@ const SKIN_HSR: SkinProfile = SkinProfile {
     target_mc: 45_500, // 45.5°C — GPU-heavy shader titles (Honkai: Star Rail)
     floors_khz: [1_401_600, 1_516_800, 1_401_600, 1_363_200],
     cluster_exp: [0.45, 0.80, 0.95, 1.50],
+    ceil_khz: [0; MAX_CLUSTERS],
     gpu_floor_hz: 763_000_000,
+    gpu_ceil_hz: 0,
+    game: true,
     lifts_on_interaction: false,
 };
 
@@ -1796,6 +1824,10 @@ pub struct SsAlgo {
     last_run: Option<Instant>,
     /// Caps lifted to hardware max for an interaction.
     lift: bool,
+    /// User skin target for game profiles (mC); 0 = the profile's own.
+    game_target_mc: i64,
+    /// Efficiency ceilings of the skin profiles in force.
+    ceilings: bool,
 }
 
 impl SsAlgo {
@@ -1809,6 +1841,7 @@ impl SsAlgo {
             written: 0,
             steps: Vec::new(),
             floor: 0,
+            ceil: 0,
             levels: [SsLevel { trig_mc: 0, clr_mc: 0, freq: 0 }; MAX_SS_LEVELS],
             level_count: 0,
             name: "",
@@ -1861,6 +1894,8 @@ impl SsAlgo {
             skin_logged: 1.0,
             last_run: None,
             lift: false,
+            game_target_mc: 0,
+            ceilings: true,
         };
 
         algo.apply_profile(profile);
@@ -1869,9 +1904,15 @@ impl SsAlgo {
     }
 
     fn sync_skin_floors(&mut self) {
-        if let Some((_, sp)) = self.skin {
-            for (i, cluster) in self.clusters.iter_mut().enumerate() {
-                cluster.floor = sp.floors_khz[i];
+        let skin = self.skin.as_ref().map(|(_, sp)| *sp);
+        let ceilings = self.ceilings;
+        for (i, cluster) in self.clusters.iter_mut().enumerate() {
+            match skin {
+                Some(sp) => {
+                    cluster.floor = sp.floors_khz[i];
+                    cluster.ceil = if ceilings { sp.ceil_khz[i] } else { 0 };
+                }
+                None => cluster.ceil = 0,
             }
         }
     }
@@ -1974,7 +2015,8 @@ impl SsAlgo {
         let lift = self.lift;
 
         if let Some((skin, sp)) = self.skin.as_mut() {
-            let out = skin.update(vsensor0_mc, sp.target_mc, dt);
+            let target_mc = if sp.game && self.game_target_mc > 0 { self.game_target_mc } else { sp.target_mc };
+            let out = skin.update(vsensor0_mc, target_mc, dt);
             let emergency = vsensor0_mc >= SKIN_EMERGENCY_MC;
             for (i, cluster) in self.clusters.iter_mut().enumerate() {
                 let cluster_out = if out >= 1.0 {
@@ -1996,7 +2038,7 @@ impl SsAlgo {
                 info!("Skin({}): {:.1}°C/{:.1}°C → output {:.2}, caps {}/{}/{}/{} kHz",
                       self.active_profile_name,
                       vsensor0_mc as f64 / 1000.0,
-                      sp.target_mc as f64 / 1000.0,
+                      target_mc as f64 / 1000.0,
                       out,
                       self.clusters[0].cap, self.clusters[1].cap,
                       self.clusters[2].cap, self.clusters[3].cap);
@@ -2065,6 +2107,11 @@ impl SsAlgo {
         info!("SS: all clusters restored to hw max");
     }
 
+    /// Skin target for game profiles from the user (mC); 0 restores each profile's own.
+    pub fn set_game_target(&mut self, target_mc: i64) {
+        self.game_target_mc = target_mc;
+    }
+
     /// Lifts every cluster to hardware max (an interaction) or back to its cap.
     pub fn set_lift(&mut self, lift: bool) {
         self.lift = lift;
@@ -2087,6 +2134,22 @@ impl SsAlgo {
     /// Active skin-loop GPU floor (Hz), for demand-aware GPU scaling in `MonitorAlgo`.
     pub fn skin_gpu_floor_hz(&self) -> i64 {
         self.skin.as_ref().map_or(SKIN_DEFAULT.gpu_floor_hz, |(_, sp)| sp.gpu_floor_hz)
+    }
+
+    /// GPU cap the skin loop allows at output 1 (Hz); 0 = hardware max.
+    pub fn skin_gpu_ceil_hz(&self) -> i64 {
+        if !self.ceilings {
+            return 0;
+        }
+        self.skin.as_ref().map_or(0, |(_, sp)| sp.gpu_ceil_hz)
+    }
+
+    /// Turns the skin profiles' efficiency ceilings on or off (off = hardware max at output 1).
+    pub fn set_ceilings(&mut self, enabled: bool) {
+        if enabled != self.ceilings {
+            self.ceilings = enabled;
+            self.sync_skin_floors();
+        }
     }
 
     /// Apply per-cluster user CPU ceilings from Pentas (kHz; `0` = uncapped).
@@ -2128,6 +2191,7 @@ impl SsAlgo {
             written: hw_max[i],
             steps: opps[i].to_vec(),
             floor: SKIN_DEFAULT.floors_khz[i],
+            ceil: 0,
             levels: [SsLevel { trig_mc: 0, clr_mc: 0, freq: 0 }; MAX_SS_LEVELS],
             level_count: 0,
             name: CLUSTER_NAMES[i],
@@ -2158,6 +2222,8 @@ impl SsAlgo {
             skin_logged: 1.0,
             last_run: None,
             lift: false,
+            game_target_mc: 0,
+            ceilings: true,
         };
         algo.sync_skin_floors();
         algo

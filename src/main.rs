@@ -119,6 +119,8 @@ fn main() {
         ss_algo.set_user_caps(config.user_cpu_caps);
         monitor.set_user_gpu_cap(config.user_gpu_cap_hz);
     }
+    ss_algo.set_game_target(config.game_target_mc);
+    ss_algo.set_ceilings(config.game_ceilings);
 
     // Sync the monitor theme to the SS profile that was active at startup, so
     // the first cycles don't run GLOBAL thresholds under a gaming profile.
@@ -213,6 +215,8 @@ fn poll_cycle(
         ss.set_user_caps(config.user_cpu_caps);
         monitor.set_user_gpu_cap(config.user_gpu_cap_hz);
     }
+    ss.set_game_target(config.game_target_mc);
+    ss.set_ceilings(config.game_ceilings);
 
     // Reload custom charging profile if mode="custom" and seq changed (0-alloc when unchanged).
     sic.maybe_reload_custom();
@@ -297,7 +301,7 @@ fn poll_cycle(
     }
 
     // Screen-on only: sample CPU/GPU utilisation and drive demand-aware GPU skin scaling.
-    monitor.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz());
+    monitor.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz(), ss.skin_gpu_ceil_hz());
     if screen_on {
         if ss.skin_output().is_some() {
             budget.update(vsensor0, ss.skin_target_mc());

@@ -298,7 +298,7 @@ where
         } else {
             0.5
         };
-        mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz());
+        mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz(), ss.skin_gpu_ceil_hz());
         mon.set_gpu_share(gpu_share);
         mon.run(filtered_mc);
 
@@ -406,7 +406,7 @@ fn sim_hsr_gpu_bound_prime_first_budget() {
         let raw = plant.step(ss.applied_caps_khz(), mon.applied_gpu_cap_hz(), hsr, 1.0);
         let filt = kf.update_dt(raw, 1.0);
         ss.run_predictive_dt(filt, kf.rate(), 1.0);
-        mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz());
+        mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz(), ss.skin_gpu_ceil_hz());
         mon.set_gpu_share(0.68); // GPU-bound
         mon.run(filt);
     }
@@ -474,7 +474,7 @@ fn sim_nolimit_cooler_and_50c_unthrottled() {
     let mut mon = MonitorAlgo::new_simulated("performance", OPPS_GPU_HZ);
     for temp_mc in (46_000..=51_500).step_by(500) {
         ss.run_predictive_dt(temp_mc, 400.0, 1.0); // fast +0.4°C/s ramp
-        mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz());
+        mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz(), ss.skin_gpu_ceil_hz());
         mon.run(temp_mc);
         assert_eq!(
             ss.applied_caps_khz(), HW_MAX_CPU,
@@ -497,7 +497,7 @@ fn sim_gaming_while_fast_charging_stable() {
     );
     assert_eq!(chg.cliff_drops, 0);
     assert!(chg.peak_skin_c < 47.0, "Gaming+charging skin runaway: {:.1}C", chg.peak_skin_c);
-    assert!(chg.min_big_khz >= 1_286_400, "Balanced gaming big cluster below floor");
+    assert!(chg.min_big_khz >= 1_190_400, "Balanced gaming big cluster below floor");
 }
 
 #[test]
@@ -512,7 +512,7 @@ fn sim_user_pentas_caps_and_touch_lift_invariant() {
     // Even when cold (34°C) or lifted by touch, user ceiling must NEVER be exceeded.
     ss.run_predictive_dt(34_000, 0.0, 1.0);
     ss.set_lift(true);
-    mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz());
+    mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz(), ss.skin_gpu_ceil_hz());
     mon.set_lift(true);
     mon.run(34_000);
 
@@ -527,7 +527,7 @@ fn sim_user_pentas_caps_and_touch_lift_invariant() {
     mon.set_lift(false);
     for _ in 0..120 {
         ss.run_predictive_dt(46_000, 0.0, 1.0);
-        mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz());
+        mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz(), ss.skin_gpu_ceil_hz());
         mon.run(46_000);
     }
     assert!(ss.applied_caps_khz()[3] <= 2_284_800);
@@ -538,7 +538,7 @@ fn sim_user_pentas_caps_and_touch_lift_invariant() {
     mon.set_user_gpu_cap(0);
     for _ in 0..200 {
         ss.run_predictive_dt(35_000, 0.0, 1.0);
-        mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz());
+        mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz(), ss.skin_gpu_ceil_hz());
         mon.run(35_000);
     }
     assert_eq!(ss.applied_caps_khz(), HW_MAX_CPU);
@@ -565,4 +565,53 @@ fn sim_kalman_variable_dt_and_suspend_recovery() {
     let wake = kf.update_dt(31_000, 45.0);
     assert_eq!(wake, 31_000);
     assert_eq!(kf.rate(), 0.0, "suspend resume must zero stale Kalman rate");
+}
+
+#[test]
+fn sim_gaming_efficiency_ceilings_and_user_target() {
+    let ceil = [1_900_800, 2_323_200, 2_323_200, 2_169_600];
+    let mut ss = SsAlgo::new_simulated("gaming", HW_MAX_CPU, CPU_OPPS, false);
+    let mut mon = MonitorAlgo::new_simulated("gaming", OPPS_GPU_HZ);
+    let tick = |ss: &mut SsAlgo, mon: &mut MonitorAlgo, mc: i64, n: usize| {
+        for _ in 0..n {
+            ss.run_predictive_dt(mc, 0.0, 1.0);
+            mon.set_skin_output(ss.skin_output(), ss.skin_gpu_floor_hz(), ss.skin_gpu_ceil_hz());
+            mon.run(mc);
+        }
+    };
+
+    // Cool phone: the knee, not hardware max.
+    tick(&mut ss, &mut mon, 33_000, 5);
+    assert_eq!(ss.applied_caps_khz(), ceil);
+    assert_eq!(mon.applied_gpu_cap_hz(), 965_000_000);
+
+    // Ceilings off: hardware max again.
+    ss.set_ceilings(false);
+    tick(&mut ss, &mut mon, 33_000, 5);
+    assert_eq!(ss.applied_caps_khz(), HW_MAX_CPU);
+    assert_eq!(mon.applied_gpu_cap_hz(), 1_162_000_000);
+    ss.set_ceilings(true);
+    tick(&mut ss, &mut mon, 33_000, 1);
+    assert_eq!(ss.applied_caps_khz(), ceil);
+
+    // 38.5 °C sits under the 39 °C default: no throttle once the step's rate brake has
+    // recovered. A 38 °C user target throttles.
+    tick(&mut ss, &mut mon, 38_500, 180);
+    assert_eq!(ss.applied_caps_khz(), ceil);
+    ss.set_game_target(38_000);
+    tick(&mut ss, &mut mon, 38_500, 60);
+    assert!(ss.applied_caps_khz()[1] < ceil[1], "user target ignored");
+    assert!(ss.applied_caps_khz()[1] >= 1_190_400, "below the floor");
+
+    // Hot: never under the floors, never over the ceilings.
+    tick(&mut ss, &mut mon, 46_000, 300);
+    let caps = ss.applied_caps_khz();
+    assert!(caps[1] >= 1_190_400 && caps[1] <= ceil[1]);
+    assert!(mon.applied_gpu_cap_hz() >= 515_000_000 && mon.applied_gpu_cap_hz() <= 965_000_000);
+
+    // The daily profile has no ceilings and ignores the game target.
+    let mut daily = SsAlgo::new_simulated("default", HW_MAX_CPU, CPU_OPPS, false);
+    daily.set_game_target(36_000);
+    for _ in 0..5 { daily.run_predictive_dt(38_000, 0.0, 1.0); }
+    assert_eq!(daily.applied_caps_khz(), HW_MAX_CPU);
 }
